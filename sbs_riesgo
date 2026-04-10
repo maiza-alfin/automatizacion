@@ -1,0 +1,253 @@
+"""
+consolidar_sbs.py
+=================
+Consolida archivos Excel de la SBS (Ranking de Créditos Directos)
+en un único Excel con una sola hoja.
+
+USO:
+    python consolidar_sbs.py                        → busca en carpeta actual
+    python consolidar_sbs.py --carpeta C:/mis_excels
+    python consolidar_sbs.py --carpeta ./data --salida resultado_2025.xlsx
+
+NOMBRES DE ARCHIVO SOPORTADOS:
+    B-2333-en2026.XLS, B-2333-fe2025.xlsx, CM-0001-ma2024.xls, etc.
+    El script detecta los 2 últimos caracteres antes del año como código de mes:
+    en=Ene, fe=Feb, ma=Mar, ab=Abr, my=May, jn=Jun,
+    jl=Jul, ag=Ago, se=Sep, oc=Oct, no=Nov, di=Dic
+
+TIPO DE ENTIDAD (detectado por prefijo del nombre de archivo):
+    B-     → Banco
+    CM-    → Caja Municipal
+    CR-    → Caja Rural
+    ED-    → Edpyme
+    FIN-   → Financiera
+    (otros)→ Otro
+"""
+import argparse
+import re
+from pathlib import Path
+import pandas as pd
+
+# ─── CONFIG ─────────────────────────────────────────
+
+MES_MAP = {
+    'en': ('Ene', 1),  'fe': ('Feb', 2),  'ma': ('Mar', 3),
+    'ab': ('Abr', 4),  'my': ('May', 5),  'jn': ('Jun', 6),
+    'jl': ('Jul', 7),  'ag': ('Ago', 8),  'se': ('Sep', 9),
+    'oc': ('Oct', 10), 'no': ('Nov', 11), 'di': ('Dic', 12),
+}
+
+TIPO_MAP = {
+    'B-': 'Banco', 'CM-': 'Caja Municipal',
+    'CR-': 'Caja Rural', 'ED-': 'Edpyme', 'FIN-': 'Financiera',
+}
+
+# ─── HELPERS ───────────────────────────────────────
+
+def clean_entity(name):
+    name = str(name).strip()
+    name = re.sub(r'\.(\s*)$', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    return name
+
+def parse_filename(filepath):
+    stem = filepath.stem.lower()
+    m = re.search(r'([a-z]{2})(\d{4})$', stem)
+    if not m:
+        return None, None, None
+    mes_code, anio = m.group(1), int(m.group(2))
+    if mes_code not in MES_MAP:
+        return None, None, None
+    mes_nombre, mes_num = MES_MAP[mes_code]
+    return f"{mes_nombre}-{str(anio)[2:]}", mes_num, anio
+
+def detect_tipo(filepath):
+    name = filepath.stem.upper()
+    for prefix, tipo in TIPO_MAP.items():
+        if name.startswith(prefix):
+            return tipo
+    return 'Otro'
+
+def safe_float(val):
+    try:
+        return float(str(val).replace(",", "").replace("-", "0"))
+    except:
+        return 0.0
+
+# 🔍 buscar texto
+def find_text(df, keyword):
+    keyword = keyword.lower()
+    for i in range(len(df)):
+        for j in range(len(df.columns)):
+            val = str(df.iloc[i, j]).lower()
+            if keyword in val:
+                return i, j
+    return None, None
+
+# 🔥 DETECTAR INICIO REAL (por estructura)
+def find_data_start_row(df, row_start, base_col):
+    for i in range(row_start, row_start + 20):
+        try:
+            rank = df.iloc[i, base_col]
+            name = df.iloc[i, base_col + 2]
+            monto = df.iloc[i, base_col + 3]
+
+            if (
+                str(rank).strip().isdigit() and
+                isinstance(name, str) and len(name.strip()) > 3 and
+                pd.notna(monto)
+            ):
+                return i
+        except:
+            continue
+
+    return row_start + 2  # fallback
+
+# 🔥 EXTRACCIÓN CORRECTA
+def extract_block_structured(df, start_row, base_col):
+    data = {}
+
+    name_col = base_col + 2
+    monto_col = base_col + 3
+
+    for i in range(start_row, start_row + 25):
+        if i >= len(df):
+            break
+
+        name = df.iloc[i, name_col]
+        monto = df.iloc[i, monto_col]
+
+        if pd.isna(name):
+            continue
+
+        name = str(name).strip()
+
+        if name.isdigit():
+            continue
+
+        if len(name) < 3:
+            continue
+
+        if "empresa" in name.lower():
+            continue
+
+        data[clean_entity(name)] = safe_float(monto)
+
+    return data
+
+# ─── PROCESAMIENTO ─────────────────────────────────
+
+def process_file(filepath):
+    try:
+        df = pd.read_excel(filepath, header=None)
+    except Exception as e:
+        print(f"❌ Error leyendo {filepath.name}: {e}")
+        return pd.DataFrame()
+
+    fecha, mes_num, anio = parse_filename(filepath)
+    if not fecha:
+        print(f"⚠️ Nombre inválido: {filepath.name}")
+        return pd.DataFrame()
+
+    tipo = detect_tipo(filepath)
+
+    # 🔎 detectar bloques
+    row_corp, col_corp = find_text(df, "corporativo")
+    row_peq, col_peq   = find_text(df, "peque")
+    row_cons, col_cons = find_text(df, "revolvente")
+
+    if None in [row_corp, row_peq, row_cons]:
+        print(f"⚠️ No compatible: {filepath.name}")
+        return pd.DataFrame()
+
+    # 🔥 detectar inicio REAL
+    start_corp = find_data_start_row(df, row_corp, col_corp)
+    start_peq  = find_data_start_row(df, row_peq, col_peq)
+    start_cons = find_data_start_row(df, row_cons, col_cons)
+
+    # ── BLOQUE 1 ──
+    corp = extract_block_structured(df, start_corp, col_corp)
+    gran = extract_block_structured(df, start_corp, col_corp + 7)
+    med  = extract_block_structured(df, start_corp, col_corp + 14)
+
+    # ── BLOQUE 2 ──
+    peq   = extract_block_structured(df, start_peq, col_peq)
+    micro = extract_block_structured(df, start_peq, col_peq + 7)
+    hip   = extract_block_structured(df, start_peq, col_peq + 14)
+
+    # ── BLOQUE 3 ──
+    cons_r  = extract_block_structured(df, start_cons, col_cons)
+    cons_nr = extract_block_structured(df, start_cons, col_cons + 7)
+
+    all_entities = set().union(
+        corp, gran, med, peq, micro, hip, cons_r, cons_nr
+    )
+
+    rows = []
+
+    for emp in sorted(all_entities):
+        vals = [
+            corp.get(emp,0), gran.get(emp,0), med.get(emp,0),
+            peq.get(emp,0), micro.get(emp,0),
+            cons_r.get(emp,0), cons_nr.get(emp,0), hip.get(emp,0)
+        ]
+
+        rows.append({
+            'Fecha': fecha,
+            'Tipo': tipo,
+            'Entidad Financiera': emp,
+            'C. Corp.': vals[0],
+            'C. Gran. Emp.': vals[1],
+            'C. Med. E.': vals[2],
+            'C. Peq. Emp.': vals[3],
+            'C. Micr. Emp.': vals[4],
+            'C. Consumo Rev': vals[5],
+            'C. Consumo No Rev': vals[6],
+            'C. Hip.': vals[7],
+            'TC. Credito': sum(vals),
+            '_mes_num': mes_num,
+            '_anio': anio,
+        })
+
+    return pd.DataFrame(rows)
+
+# ─── MAIN ─────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--carpeta','-c',default='.')
+    parser.add_argument('--salida','-s',default='consolidado_sbs.xlsx')
+    args = parser.parse_args()
+
+    carpeta = Path(args.carpeta)
+
+    archivos = [f for f in carpeta.iterdir()
+                if f.suffix.lower() in ('.xls','.xlsx')]
+
+    if not archivos:
+        print("❌ No hay archivos")
+        return
+
+    all_dfs = []
+
+    for f in archivos:
+        print(f"Procesando {f.name}")
+        df = process_file(f)
+        if not df.empty:
+            all_dfs.append(df)
+        else:
+            print(f"⚠️ Sin datos: {f.name}")
+
+    if not all_dfs:
+        print("❌ Sin datos válidos")
+        return
+
+    final = pd.concat(all_dfs)
+    final.sort_values(by=['_anio','_mes_num','Tipo','Entidad Financiera'], inplace=True)
+
+    final.to_excel(args.salida, index=False)
+
+    print(f"\n✅ Listo: {args.salida}")
+
+if __name__ == "__main__":
+    main()
