@@ -1,0 +1,209 @@
+"""
+consolidar_sbs.py  —  Detección DINÁMICA de filas
+Consolida archivos Excel SBS sin depender de rangos fijos.
+
+USO:
+    python consolidar_sbs.py
+    python consolidar_sbs.py --carpeta C:/mis_excels
+    python consolidar_sbs.py --carpeta ./data --salida resultado.xlsx
+
+Códigos de mes: en fe ma ab my jn jl ag se oc no di
+Prefijos de tipo: B- CM-/CMAC CR-/CRAC ED- FIN-
+"""
+import argparse, re, sys
+from pathlib import Path
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+MES_MAP = {
+    'en':('Ene',1),'fe':('Feb',2),'ma':('Mar',3),'ab':('Abr',4),
+    'my':('May',5),'jn':('Jun',6),'jl':('Jul',7),'ag':('Ago',8),
+    'se':('Sep',9),'oc':('Oct',10),'no':('Nov',11),'di':('Dic',12),
+}
+TIPO_MAP = {
+    'B-':'Banco','CM-':'Caja Municipal','CMAC':'Caja Municipal',
+    'CR-':'Caja Rural','CRAC':'Caja Rural','ED-':'Edpyme',
+    'EDPYME':'Edpyme','FIN-':'Financiera','FIN':'Financiera',
+}
+# (keyword_titulo, col_nombre_abs, col_monto_abs)
+BLOCK_DEFS = [
+    ('corporativ',  2,  3),
+    ('grandes emp', 9,  10),
+    ('median',      16, 17),
+    ('pequeñ',      2,  3),
+    ('microemp',    9,  10),
+    ('hipotec',     16, 17),
+    ('consumo rev', 2,  3),
+    ('consumo no',  9,  10),
+]
+BLOCK_ORDER = ['corporativ','grandes emp','median','pequeñ','microemp','hipotec','consumo rev','consumo no']
+COLUMNAS = ['Fecha','Tipo','Entidad Financiera','C. Corp.','C. Gran. Emp.','C. Med. E.',
+            'C. Peq. Emp.','C. Micr. Emp.','C. Consumo Rev','C. Consumo No Rev','C. Hip.','TC. Credito']
+STOP_KWS = ['corporativ','grandes emp','median','pequeñ','microemp','hipotec',
+            'consumo rev','consumo no','fuente:','las definicion','no incluye']
+
+def clean_entity(name):
+    name = str(name).strip()
+    name = re.sub(r'\.\s*$','',name)
+    name = re.sub(r'B\.([A-Za-záéíóúÁÉÍÓÚ])',r'B. \1',name)
+    return re.sub(r'\s+',' ',name).strip()
+
+def parse_filename(fp):
+    m = re.search(r'([a-z]{2})(\d{4})$', fp.stem.lower())
+    if not m: return None,None,None
+    mc = MES_MAP.get(m.group(1))
+    if not mc: return None,None,None
+    return f"{mc[0]}-{m.group(2)[2:]}", mc[1], int(m.group(2))
+
+def detect_tipo(fp):
+    u = fp.stem.upper()
+    for p,t in TIPO_MAP.items():
+        if u.startswith(p): return t
+    return 'Otro'
+
+def safe_float(v):
+    if pd.isna(v) or str(v).strip() in ('-','','nan'): return 0.0
+    try: return float(v)
+    except: return 0.0
+
+def find_data_rows(df, header_row, name_col):
+    rows, in_data, empty_streak = [], False, 0
+    for r in range(header_row+1, min(header_row+60, len(df))):
+        rank_val = df.iloc[r,0]
+        name_val = df.iloc[r,name_col] if name_col < df.shape[1] else None
+        if not in_data:
+            try:
+                if int(float(str(rank_val)))==1 and pd.notna(name_val): in_data=True
+            except: pass
+        if not in_data: continue
+        if pd.notna(rank_val) and isinstance(rank_val,str):
+            if any(kw in rank_val.lower() for kw in STOP_KWS): break
+        has_name = pd.notna(name_val) and str(name_val).strip() not in ('','nan')
+        if has_name:
+            rows.append(r); empty_streak=0
+        else:
+            empty_streak+=1
+            if empty_streak>=2: break
+    return rows
+
+def find_all_blocks(df):
+    found={}
+    for kw,nc,mc in BLOCK_DEFS:
+        for i in range(len(df)):
+            for j in range(min(20,df.shape[1])):
+                val=df.iloc[i,j]
+                if not pd.notna(val): continue
+                s=str(val).lower()
+                if kw=='consumo no' and 'no rev' not in s: continue
+                if kw=='consumo rev' and 'no rev' in s: continue
+                if kw not in s: continue
+                rows=find_data_rows(df,i,nc)
+                if rows: found[kw]=(nc,mc,rows)
+                break
+            if kw in found: break
+    return found
+
+def extract_block(df,nc,mc,rows):
+    result={}
+    for r in rows:
+        if r>=len(df): continue
+        emp=df.iloc[r,nc] if nc<df.shape[1] else None
+        mon=df.iloc[r,mc] if mc<df.shape[1] else None
+        if pd.notna(emp) and str(emp).strip() not in ('','nan'):
+            result[clean_entity(emp)]=safe_float(mon)
+    return result
+
+def process_file(fp):
+    try: df=pd.read_excel(fp,engine='openpyxl',header=None)
+    except:
+        try: df=pd.read_excel(fp,engine='xlrd',header=None)
+        except Exception as e: print(f"  ❌ {fp.name}: {e}"); return pd.DataFrame()
+    fecha,mes_num,anio=parse_filename(fp)
+    if not fecha: print(f"  ⚠️  Sin fecha: {fp.name}"); return pd.DataFrame()
+    tipo=detect_tipo(fp)
+    blocks=find_all_blocks(df)
+    if not blocks: print(f"  ⚠️  Sin bloques: {fp.name}"); return pd.DataFrame()
+    extracted={kw: extract_block(df,*blocks[kw]) if kw in blocks else {} for kw in BLOCK_ORDER}
+    all_ents=set()
+    for d in extracted.values(): all_ents.update(d.keys())
+    all_ents.discard('nan'); all_ents.discard('')
+    out=[]
+    for emp in sorted(all_ents):
+        c1=extracted['corporativ'].get(emp,0)
+        c2=extracted['grandes emp'].get(emp,0)
+        c3=extracted['median'].get(emp,0)
+        c4=extracted['pequeñ'].get(emp,0)
+        c5=extracted['microemp'].get(emp,0)
+        c6=extracted['consumo rev'].get(emp,0)
+        c7=extracted['consumo no'].get(emp,0)
+        c8=extracted['hipotec'].get(emp,0)
+        t=c1+c2+c3+c4+c5+c6+c7+c8
+        out.append({'Fecha':fecha,'Tipo':tipo,'Entidad Financiera':emp,
+            'C. Corp.':c1,'C. Gran. Emp.':c2,'C. Med. E.':c3,'C. Peq. Emp.':c4,
+            'C. Micr. Emp.':c5,'C. Consumo Rev':c6,'C. Consumo No Rev':c7,
+            'C. Hip.':c8,'TC. Credito':t,'_mes_num':mes_num,'_anio':anio})
+    return pd.DataFrame(out)
+
+def format_excel(out_path,df):
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Consolidado SBS"
+    thin=Side(style='thin',color="BFBFBF"); brd=Border(left=thin,right=thin,top=thin,bottom=thin)
+    for ci,cn in enumerate(COLUMNAS,1):
+        c=ws.cell(row=1,column=ci,value=cn)
+        c.font=Font(bold=True,color="FFFFFF",name="Arial",size=10)
+        c.fill=PatternFill("solid",fgColor="1F4E79")
+        c.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        c.border=brd
+    ws.row_dimensions[1].height=30
+    num_cols={'C. Corp.','C. Gran. Emp.','C. Med. E.','C. Peq. Emp.',
+              'C. Micr. Emp.','C. Consumo Rev','C. Consumo No Rev','C. Hip.','TC. Credito'}
+    for ri,(_, row) in enumerate(df[COLUMNAS].iterrows(),2):
+        alt=(ri%2==0)
+        for ci,cn in enumerate(COLUMNAS,1):
+            c=ws.cell(row=ri,column=ci,value=row[cn]); c.border=brd
+            if cn in num_cols:
+                c.number_format='#,##0'; c.alignment=Alignment(horizontal="right")
+                c.font=Font(name="Arial",size=9,bold=(cn=='TC. Credito'))
+                if cn=='TC. Credito': c.fill=PatternFill("solid",fgColor="D6E4F0")
+                elif alt: c.fill=PatternFill("solid",fgColor="EBF3FB")
+            else:
+                c.font=Font(name="Arial",size=9); c.alignment=Alignment(horizontal="left")
+                if alt: c.fill=PatternFill("solid",fgColor="EBF3FB")
+    widths={'Fecha':10,'Tipo':18,'Entidad Financiera':32,'C. Corp.':14,'C. Gran. Emp.':14,
+            'C. Med. E.':14,'C. Peq. Emp.':14,'C. Micr. Emp.':14,'C. Consumo Rev':15,
+            'C. Consumo No Rev':16,'C. Hip.':14,'TC. Credito':16}
+    for ci,cn in enumerate(COLUMNAS,1):
+        ws.column_dimensions[get_column_letter(ci)].width=widths.get(cn,14)
+    ws.freeze_panes="A2"
+    ws.auto_filter.ref=f"A1:{get_column_letter(len(COLUMNAS))}1"
+    wb.save(out_path)
+
+def main():
+    p=argparse.ArgumentParser()
+    p.add_argument('--carpeta','-c',default='.')
+    p.add_argument('--salida','-s',default='consolidado_sbs.xlsx')
+    args=p.parse_args()
+    carpeta=Path(args.carpeta)
+    if not carpeta.exists(): print(f"❌ Carpeta no existe: {carpeta}"); sys.exit(1)
+    archivos=sorted([f for f in carpeta.iterdir()
+        if f.suffix.upper() in ('.XLS','.XLSX','.XLSM')
+        and not f.name.startswith('~') and f.name!=args.salida])
+    if not archivos: print("⚠️  No se encontraron archivos Excel."); sys.exit(1)
+    print(f"\n📂 {carpeta.resolve()}\n📄 {len(archivos)} archivos\n")
+    all_dfs=[]
+    for f in archivos:
+        print(f"  ⏳ {f.name}")
+        df=process_file(f)
+        if not df.empty: all_dfs.append(df); print(f"     ✅ {len(df)} entidades")
+        else: print(f"     ⚠️  sin datos")
+    if not all_dfs: print("\n❌ Sin datos."); sys.exit(1)
+    cons=pd.concat(all_dfs,ignore_index=True)
+    cons.sort_values(['_anio','_mes_num','Tipo','Entidad Financiera'],inplace=True)
+    cons.reset_index(drop=True,inplace=True)
+    out=Path(args.salida)
+    format_excel(out,cons)
+    print(f"\n✅ {out.resolve()}")
+    print(f"   {len(cons)} filas · {cons['Fecha'].iloc[0]} → {cons['Fecha'].iloc[-1]}")
+
+if __name__=='__main__': main()
