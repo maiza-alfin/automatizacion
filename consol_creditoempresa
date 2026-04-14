@@ -1,0 +1,510 @@
+"""
+consolidar_sbs_universal.py — Consolidador Universal SBS
+Soporta: Bancos (B-), Financieras (FIN-), Cajas Municipales (C-/CMAC),
+         Cajas Rurales (C-/CRAC), Edpymes (C-/ED- o EC-)
+
+USO:
+    python consolidar_sbs_universal.py
+    python consolidar_sbs_universal.py --carpeta C:/mis_excels
+    python consolidar_sbs_universal.py --carpeta ./data --salida resultado.xlsx
+    python consolidar_sbs_universal.py --tipo cmac     # filtrar solo un tipo
+"""
+import argparse, re, sys, subprocess, tempfile
+from pathlib import Path
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ── Mapas de referencia ─────────────────────────────────────────────────────
+MES_MAP = {
+    'en':('Ene',1),'fe':('Feb',2),'ma':('Mar',3),'ab':('Abr',4),
+    'my':('May',5),'jn':('Jun',6),'jl':('Jul',7),'ag':('Ago',8),
+    'se':('Sep',9),'oc':('Oct',10),'no':('Nov',11),'di':('Dic',12),
+}
+
+# Detección de tipo por prefijo del nombre de archivo y por contenido interno
+TIPO_MAP_STEM = {
+    'B-':'Banco','FIN-':'Financiera','FIN':'Financiera',
+    'CM-':'Caja Municipal','CMAC':'Caja Municipal',
+    'CR-':'Caja Rural','CRAC':'Caja Rural',
+    'ED-':'Edpyme','EDPYME':'Edpyme',
+}
+# Detección por contenido de la primera celda de empresas encontrada
+TIPO_MAP_CONTENT = {
+    'CMAC':'Caja Municipal','CMCP':'Caja Municipal',
+    'CRAC':'Caja Rural',
+    'EC ':'Edpyme','EC\t':'Edpyme',
+}
+
+# Columnas de salida
+COLUMNAS = [
+    'Fecha','Tipo','Empresa',
+    'C. Corp.','C. Gran. Emp.','C. Med. E.',
+    'C. Peq. Emp.','C. Micr. Emp.',
+    'C. Consumo Rev','C. Consumo No Rev',
+    'C. Hip.','TC. Credito'
+]
+
+# Bloques en orden, con las palabras clave a buscar en el título del bloque
+BLOCK_ORDER = [
+    'corporativ',
+    'grandes emp',
+    'median',
+    'pequeñ',
+    'microemp',
+    'consumo rev',
+    'consumo no',
+    'hipotec',
+]
+STOP_KWS = [
+    'corporativ','grandes emp','median','pequeñ','microemp',
+    'hipotec','consumo rev','consumo no','fuente:','nota :',
+    'las definicion','no incluye','* a partir',
+]
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def clean_entity(name):
+    name = str(name).strip()
+    name = re.sub(r'\.\s*$', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name
+
+def safe_float(v):
+    if pd.isna(v) or str(v).strip() in ('-', '', 'nan'):
+        return 0.0
+    try:
+        return float(v)
+    except:
+        return 0.0
+
+def parse_filename(fp):
+    """Devuelve (fecha_str, mes_num, anio) desde el nombre del archivo."""
+    m = re.search(r'([a-z]{2})(\d{4})$', fp.stem.lower())
+    if not m:
+        return None, None, None
+    mc = MES_MAP.get(m.group(1))
+    if not mc:
+        return None, None, None
+    return f"{mc[0]}-{m.group(2)[2:]}", mc[1], int(m.group(2))
+
+def detect_tipo_stem(fp):
+    u = fp.stem.upper()
+    for p, t in TIPO_MAP_STEM.items():
+        if u.startswith(p):
+            return t
+    return None
+
+def detect_tipo_content(df):
+    """Detecta tipo mirando los primeros nombres de empresa en el archivo."""
+    for i in range(min(30, len(df))):
+        for j in range(min(5, df.shape[1])):
+            val = str(df.iloc[i, j]).strip()
+            for prefix, tipo in TIPO_MAP_CONTENT.items():
+                if val.startswith(prefix):
+                    return tipo
+    return 'Otro'
+
+def xls_to_xlsx(fp):
+    """Convierte .xls a .xlsx usando LibreOffice si es necesario."""
+    #if fp.suffix.upper() == '.XLS':
+     #   tmp = Path(tempfile.mkdtemp())
+      #  result = subprocess.run(
+       #     ['libreoffice','--headless','--convert-to','xlsx','--outdir', str(tmp), str(fp)],
+        #    capture_output=True, text=True, timeout=60
+        #)
+        #converted = tmp / (fp.stem + '.xlsx')
+        #if converted.exists():
+         #   return converted
+        # Si falla la conversión, intentar openpyxl directamente (algunos xls son xlsx renombrados)
+    return fp
+
+# ── Detección dinámica de bloques ────────────────────────────────────────────
+def kw_match(cell_val, kw):
+    """Verifica si una celda es un TITULO de bloque, no nombre de empresa."""
+    s = str(cell_val).lower().strip()
+    # Descartar nombres de empresas por sus prefijos tipicos
+    for prefix in ('ec ', 'cmac ', 'cmcp ', 'crac ', 'financiera ', 'banco ',
+                   'mitsui', 'bcp', 'bbva', 'scotiabank', 'interbank'):
+        if s.startswith(prefix):
+            return False
+    if len(s) < 8:
+        return False
+    if kw == 'consumo no':
+        return 'consumo' in s and 'no rev' in s
+    if kw == 'consumo rev':
+        return 'consumo' in s and 'no rev' not in s and ('credito' in s or 'crédito' in s)
+    return kw in s
+
+def detect_layout(df):
+    """
+    Detecta si el archivo usa layout de 7 columnas (Bancos/Financieras: B-)
+    o de 6 columnas (CMAC/CRAC/Edpyme: C-).
+    
+    Layout A (7 cols): ranking | gap | Empresa | Monto | Part | Acum | gap | ...
+    Layout B (6 cols): ranking | Empresa | Monto | Part | Acum | gap | ...
+    
+    Retorna (name_col_offset, amount_col_offset) relativos al inicio de cada bloque.
+    """
+    # Buscar la primera fila de encabezado de bloque con "Empresas"
+    for i in range(min(20, len(df))):
+        for j in range(min(20, df.shape[1])):
+            val = str(df.iloc[i, j]).lower().strip()
+            if val == 'empresas':
+                # Mirar la siguiente fila de datos (ranking)
+                for r in range(i+1, min(i+5, len(df))):
+                    rank = df.iloc[r, j]
+                    try:
+                        if int(float(str(rank))) == 1:
+                            # name_col es j+1 o j+2?
+                            col_a = df.iloc[r, j+1] if j+1 < df.shape[1] else None
+                            col_b = df.iloc[r, j+2] if j+2 < df.shape[1] else None
+                            # Si col_a es NaN y col_b es nombre → layout 7 (gap en j+1)
+                            a_empty = pd.isna(col_a) or str(col_a).strip() in ('nan', '')
+                            b_empty = pd.isna(col_b) or str(col_b).strip() in ('nan', '')
+                            if a_empty and not b_empty:
+                                return 2, 3  # Layout A (Bancos/Financieras)
+                            elif not a_empty and b_empty:
+                                return 1, 2  # Layout B (CMAC/CRAC/Edpyme) - raro
+                            elif not a_empty:
+                                return 1, 2  # Layout B (CMAC/CRAC/Edpyme)
+                    except:
+                        pass
+    return 1, 2  # Default: layout B
+
+def find_all_blocks(df, name_off, amount_off):
+    """
+    Encuentra todos los bloques de crédito en el DataFrame.
+    Devuelve dict: {kw: (name_col_abs, amount_col_abs, [filas_de_datos])}
+    """
+    found = {}
+    block_cols = []  # columnas absolutas de inicio de cada bloque
+
+    # Primero localizar todos los títulos de bloque
+    title_rows = {}
+    for kw in BLOCK_ORDER:
+        for i in range(len(df)):
+            for j in range(min(25, df.shape[1])):
+                val = df.iloc[i, j]
+                if not pd.notna(val):
+                    continue
+                if kw_match(val, kw) and kw not in title_rows:
+                    title_rows[kw] = (i, j)
+                    break
+            if kw in title_rows:
+                break
+
+    # Para cada bloque encontrado, detectar filas de datos
+    for kw, (title_row, title_col) in title_rows.items():
+        nc = title_col + name_off
+        mc = title_col + amount_off
+        rows = find_data_rows(df, title_row, nc)
+        if rows:
+            found[kw] = (nc, mc, rows)
+
+    return found
+
+def find_data_rows(df, header_row, name_col):
+    """Encuentra las filas de datos bajo un encabezado de bloque.
+    
+    El ranking puede estar en col 0 (bloques del lado izquierdo) o en
+    name_col-1 / name_col-2 (bloques del lado derecho/centro). Se busca
+    en ambas posibilidades para ser robusto.
+    """
+    rows, in_data, empty_streak = [], False, 0
+    # Columnas candidatas donde puede estar el número de ranking
+    rank_candidates = sorted(set([0, max(0, name_col - 1), max(0, name_col - 2)]))
+
+    for r in range(header_row + 1, min(header_row + 80, len(df))):
+        name_val = df.iloc[r, name_col] if name_col < df.shape[1] else None
+
+        if not in_data:
+            for rank_col in rank_candidates:
+                rank_val = df.iloc[r, rank_col] if rank_col < df.shape[1] else None
+                try:
+                    if int(float(str(rank_val))) == 1 and pd.notna(name_val) and str(name_val).strip() not in ('nan', ''):
+                        in_data = True
+                        break
+                except:
+                    pass
+
+        if not in_data:
+            continue
+
+        # Parar si encontramos otro título de bloque o notas (buscar en toda la fila)
+        stop = False
+        for col in range(df.shape[1]):
+            cell = df.iloc[r, col]
+            if pd.notna(cell) and any(kw in str(cell).lower() for kw in STOP_KWS):
+                stop = True
+                break
+        if stop:
+            return rows
+
+        has_name = pd.notna(name_val) and str(name_val).strip() not in ('nan', '')
+        if has_name:
+            rows.append(r)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            if empty_streak >= 3:
+                break
+
+    return rows
+
+def extract_block(df, nc, mc, rows):
+    """Extrae {empresa: monto} de un bloque."""
+    result = {}
+    for r in rows:
+        emp = df.iloc[r, nc] if nc < df.shape[1] else None
+        mon = df.iloc[r, mc] if mc < df.shape[1] else None
+        if pd.notna(emp) and str(emp).strip() not in ('nan', ''):
+            result[clean_entity(emp)] = safe_float(mon)
+    return result
+
+# ── Procesamiento de archivo ─────────────────────────────────────────────────
+def process_file(fp):
+    # Convertir xls si es necesario
+    fp_work = xls_to_xlsx(fp)
+
+    try:
+        if fp.suffix.lower() == '.xls':
+        # Archivos antiguos
+            df = pd.read_excel(fp, header=None, engine='xlrd')
+        else:
+        # Archivos modernos
+            df = pd.read_excel(fp, header=None, engine='openpyxl')
+
+    except Exception as e:
+        print(f"  ⚠️ Error con engine específico: {e}")
+        try:
+        # Fallback automático (por si está mal renombrado)
+            df = pd.read_excel(fp, header=None)
+        except Exception as e2:
+            print(f"  ❌ {fp.name}: {e2}")
+            return pd.DataFrame()
+    fecha, mes_num, anio = parse_filename(fp) 
+    if not fecha: 
+        print(f" ⚠️ Sin fecha reconocible: {fp.name}") 
+        return pd.DataFrame()
+
+    # Detectar tipo
+    tipo = detect_tipo_stem(fp) or detect_tipo_content(df) or 'Otro'
+
+    # Detectar layout y extraer bloques
+    name_off, amount_off = detect_layout(df)
+    blocks = find_all_blocks(df, name_off, amount_off)
+
+    if not blocks:
+        print(f"  ⚠️  Sin bloques detectados: {fp.name}")
+        return pd.DataFrame()
+
+    extracted = {kw: extract_block(df, *blocks[kw]) if kw in blocks else {} for kw in BLOCK_ORDER}
+
+    all_ents = set()
+    for d in extracted.values():
+        all_ents.update(d.keys())
+    all_ents.discard('nan')
+    all_ents.discard('')
+
+    out = []
+    for emp in sorted(all_ents):
+        c1 = extracted['corporativ'].get(emp, 0)
+        c2 = extracted['grandes emp'].get(emp, 0)
+        c3 = extracted['median'].get(emp, 0)
+        c4 = extracted['pequeñ'].get(emp, 0)
+        c5 = extracted['microemp'].get(emp, 0)
+        c6 = extracted['consumo rev'].get(emp, 0)
+        c7 = extracted['consumo no'].get(emp, 0)
+        c8 = extracted['hipotec'].get(emp, 0)
+        total = c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8
+        out.append({
+            'Fecha': fecha, 'Tipo': tipo, 'Empresa': emp,
+            'C. Corp.': c1, 'C. Gran. Emp.': c2, 'C. Med. E.': c3,
+            'C. Peq. Emp.': c4, 'C. Micr. Emp.': c5,
+            'C. Consumo Rev': c6, 'C. Consumo No Rev': c7,
+            'C. Hip.': c8, 'TC. Credito': total,
+            '_mes_num': mes_num, '_anio': anio,
+        })
+    return pd.DataFrame(out)
+
+# ── Formato Excel ────────────────────────────────────────────────────────────
+HEADER_COLORS = {
+    'Banco':          '1F4E79',
+    'Financiera':     '375623',
+    'Caja Municipal': '7B3F00',
+    'Caja Rural':     '4A235A',
+    'Edpyme':         '154360',
+    'Otro':           '424242',
+}
+
+def format_excel(out_path, df):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Consolidado SBS"
+
+    thin = Side(style='thin', color="BFBFBF")
+    brd = Border(left=thin, right=thin, top=thin, bottom=thin)
+    num_cols = {
+        'C. Corp.','C. Gran. Emp.','C. Med. E.','C. Peq. Emp.',
+        'C. Micr. Emp.','C. Consumo Rev','C. Consumo No Rev',
+        'C. Hip.','TC. Credito'
+    }
+
+    # Encabezado
+    for ci, cn in enumerate(COLUMNAS, 1):
+        c = ws.cell(row=1, column=ci, value=cn)
+        c.font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+        c.fill = PatternFill("solid", fgColor="1F3864")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = brd
+    ws.row_dimensions[1].height = 30
+
+    # Datos
+    tipo_prev = None
+    for ri, (_, row) in enumerate(df[COLUMNAS].iterrows(), 2):
+        tipo_actual = row['Tipo']
+        color_header = HEADER_COLORS.get(tipo_actual, '424242')
+        alt = (ri % 2 == 0)
+
+        for ci, cn in enumerate(COLUMNAS, 1):
+            c = ws.cell(row=ri, column=ci, value=row[cn])
+            c.border = brd
+            if cn in num_cols:
+                c.number_format = '#,##0'
+                c.alignment = Alignment(horizontal="right")
+                c.font = Font(name="Arial", size=9, bold=(cn == 'TC. Credito'))
+                if cn == 'TC. Credito':
+                    c.fill = PatternFill("solid", fgColor="D6E4F0")
+                elif alt:
+                    c.fill = PatternFill("solid", fgColor="EBF3FB")
+            else:
+                c.font = Font(name="Arial", size=9)
+                c.alignment = Alignment(horizontal="left")
+                if alt:
+                    c.fill = PatternFill("solid", fgColor="EBF3FB")
+
+    # Anchos de columna
+    widths = {
+        'Fecha': 10, 'Tipo': 18, 'Empresa': 32,
+        'C. Corp.': 14, 'C. Gran. Emp.': 14, 'C. Med. E.': 14,
+        'C. Peq. Emp.': 14, 'C. Micr. Emp.': 14,
+        'C. Consumo Rev': 15, 'C. Consumo No Rev': 16,
+        'C. Hip.': 14, 'TC. Credito': 16,
+    }
+    for ci, cn in enumerate(COLUMNAS, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = widths.get(cn, 14)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNAS))}1"
+
+    # Hoja resumen por tipo
+    tipos = df['Tipo'].unique()
+    for tipo in sorted(tipos):
+        sub = df[df['Tipo'] == tipo].copy()
+        if sub.empty:
+            continue
+        safe_name = tipo[:31]
+        ws2 = wb.create_sheet(title=safe_name)
+        color = HEADER_COLORS.get(tipo, '424242')
+
+        for ci, cn in enumerate(COLUMNAS, 1):
+            c = ws2.cell(row=1, column=ci, value=cn)
+            c.font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+            c.fill = PatternFill("solid", fgColor=color)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = brd
+        ws2.row_dimensions[1].height = 30
+
+        for ri, (_, row) in enumerate(sub[COLUMNAS].iterrows(), 2):
+            alt = (ri % 2 == 0)
+            for ci, cn in enumerate(COLUMNAS, 1):
+                c = ws2.cell(row=ri, column=ci, value=row[cn])
+                c.border = brd
+                if cn in num_cols:
+                    c.number_format = '#,##0'
+                    c.alignment = Alignment(horizontal="right")
+                    c.font = Font(name="Arial", size=9, bold=(cn == 'TC. Credito'))
+                    if cn == 'TC. Credito':
+                        c.fill = PatternFill("solid", fgColor="D6E4F0")
+                    elif alt:
+                        c.fill = PatternFill("solid", fgColor="EBF3FB")
+                else:
+                    c.font = Font(name="Arial", size=9)
+                    c.alignment = Alignment(horizontal="left")
+                    if alt:
+                        c.fill = PatternFill("solid", fgColor="EBF3FB")
+
+        for ci, cn in enumerate(COLUMNAS, 1):
+            ws2.column_dimensions[get_column_letter(ci)].width = widths.get(cn, 14)
+        ws2.freeze_panes = "A2"
+        ws2.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNAS))}1"
+
+    wb.save(out_path)
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    p = argparse.ArgumentParser(description="Consolidador Universal SBS")
+    p.add_argument('--carpeta', '-c', default='.')
+    p.add_argument('--salida', '-s', default='consolidado_sbs_universal.xlsx')
+    p.add_argument('--tipo', '-t', default=None,
+                   help='Filtrar por tipo: banco, financiera, cmac, crac, edpyme')
+    args = p.parse_args()
+
+    carpeta = Path(args.carpeta)
+    if not carpeta.exists():
+        print(f"❌ Carpeta no existe: {carpeta}")
+        sys.exit(1)
+
+    archivos = sorted([
+        f for f in carpeta.iterdir()
+        if f.suffix.upper() in ('.XLS', '.XLSX', '.XLSM')
+        and not f.name.startswith('~')
+        and f.name != args.salida
+    ])
+    if not archivos:
+        print("⚠️  No se encontraron archivos Excel.")
+        sys.exit(1)
+
+    # Filtro opcional por tipo
+    TIPO_FILTER = {
+        'banco': 'Banco', 'financiera': 'Financiera',
+        'cmac': 'Caja Municipal', 'crac': 'Caja Rural', 'edpyme': 'Edpyme',
+    }
+    tipo_filtro = TIPO_FILTER.get((args.tipo or '').lower())
+
+    print(f"\n📂 {carpeta.resolve()}")
+    print(f"📄 {len(archivos)} archivos encontrados\n")
+
+    all_dfs = []
+    for f in archivos:
+        print(f"  ⏳ {f.name}")
+        df = process_file(f)
+        if not df.empty:
+            if tipo_filtro and not df['Tipo'].str.contains(tipo_filtro).any():
+                print(f"     ⏭️  Tipo no coincide ({df['Tipo'].iloc[0]}), se omite")
+                continue
+            all_dfs.append(df)
+            tipos_encontrados = df['Tipo'].unique().tolist()
+            print(f"     ✅ {len(df)} empresas  |  Tipo: {', '.join(tipos_encontrados)}")
+        else:
+            print(f"     ⚠️  sin datos extraídos")
+
+    if not all_dfs:
+        print("\n❌ Sin datos para consolidar.")
+        sys.exit(1)
+
+    cons = pd.concat(all_dfs, ignore_index=True)
+    cons.sort_values(['_anio', '_mes_num', 'Tipo', 'Empresa'], inplace=True)
+    cons.reset_index(drop=True, inplace=True)
+
+    out = Path(args.salida)
+    format_excel(out, cons)
+
+    print(f"\n✅ Archivo generado: {out.resolve()}")
+    print(f"   {len(cons)} filas totales")
+    print(f"   Tipos incluidos: {', '.join(cons['Tipo'].unique())}")
+    print(f"   Período: {cons['Fecha'].iloc[0]} → {cons['Fecha'].iloc[-1]}")
+
+if __name__ == '__main__':
+    main()
