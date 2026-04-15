@@ -1,0 +1,799 @@
+"""
+====================================================
+ CONSOLIDADOR DE BALANCE GENERAL - SISTEMA FINANCIERO PERUANO
+ Autor: generado con Claude
+ Uso:   python consolidador.py
+====================================================
+Requisitos (instalar una sola vez):
+    pip install pandas openpyxl
+    pip install xlrd==1.2.0    # para leer archivos .xls antiguos
+
+Para archivos .xls modernos LibreOffice debe estar instalado,
+o el script los convierte automáticamente usando subprocess.
+====================================================
+"""
+
+import os
+import re
+import subprocess
+import shutil
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ============================================================
+# CONFIGURACIÓN: MAPEO DE TIPOS POR CÓDIGO DE ARCHIVO
+# ============================================================
+# El código del archivo (ej. B-2201, C-1101) determina el tipo de entidad.
+TIPO_MAP = {
+    'B-2201': 'Banco',
+    'B-3101': 'Financiera',
+    'C-1101': 'Caja Municipal',
+    'C-2101': 'Caja Rural',
+    'C-4103': 'EDPYME',
+}
+
+# ============================================================
+# MAPEO DE FECHAS: código del nombre de archivo -> mes
+# ============================================================
+MONTH_MAP = {
+    'en': '01', 'fe': '02', 'ma': '03', 'ab': '04',
+    'my': '05', 'ju': '06', 'jl': '07', 'ag': '08',
+    'se': '09', 'oc': '10', 'no': '11', 'di': '12'
+}
+
+# ============================================================
+# INDICADORES ORDENADOS: (etiqueta_raw, nombre_canónico, sección)
+# ============================================================
+INDICATORS_ORDERED = [
+    # ACTIVO
+    ('DISPONIBLE',                                                              'DISPONIBLE',                                                               'activo'),
+    ('   Caja',                                                                 'Caja',                                                                     'activo'),
+    ('   Bancos y Corresponsales',                                              'Bancos y Corresponsales',                                                  'activo'),
+    ('   Canje',                                                                'Canje',                                                                    'activo'),
+    ('   Otros',                                                                'Otros (Disponible)',                                                       'activo'),
+    ('FONDOS INTERBANCARIOS',                                                   'FONDOS INTERBANCARIOS',                                                    'activo'),
+    ('INVERSIONES NETAS DE PROVISIONES',                                        'INVERSIONES NETAS DE PROVISIONES',                                         'activo'),
+    ('    Inversiones a Valor Razonable con Cambios en Resultados',             'Inversiones a Valor Razonable con Cambios en Resultados',                  'activo'),
+    ('    Inversiones Disponibles para la Venta',                               'Inversiones Disponibles para la Venta',                                    'activo'),
+    ('    Inversiones a Vencimiento',                                           'Inversiones a Vencimiento',                                               'activo'),
+    ('    Inversiones en Subsidiarias, Asociadas y Negocios Conjuntos',         'Inversiones en Subsidiarias, Asociadas y Negocios Conjuntos',              'activo'),
+    ('    Inversiones en Commodities',                                          'Inversiones en Commodities',                                              'activo'),
+    ('   Provisiones',                                                          'Provisiones (Inversiones)',                                                'activo'),
+    ('CRÉDITOS NETOS DE PROVISIONES Y DE INGRESOS NO DEVENGADOS',              'CRÉDITOS NETOS DE PROVISIONES Y DE INGRESOS NO DEVENGADOS',                'activo'),
+    ('   Vigentes',                                                             'Vigentes',                                                                'activo'),
+    ('      Cuentas Corrientes',                                                'Cuentas Corrientes',                                                      'activo'),
+    ('      Tarjetas de Crédito',                                               'Tarjetas de Crédito',                                                     'activo'),
+    ('      Descuentos',                                                        'Descuentos',                                                              'activo'),
+    ('      Factoring',                                                         'Factoring',                                                               'activo'),
+    ('      Préstamos',                                                         'Préstamos',                                                               'activo'),
+    ('      Arrendamiento Financiero',                                          'Arrendamiento Financiero',                                                'activo'),
+    ('      Hipotecarios para Vivienda',                                        'Hipotecarios para Vivienda',                                              'activo'),
+    ('      Comercio Exterior',                                                 'Comercio Exterior',                                                       'activo'),
+    ('      Créditos por Liquidar',                                             'Créditos por Liquidar',                                                   'activo'),
+    ('      Otros',                                                             'Otros (Créditos Vigentes)',                                               'activo'),
+    ('   Refinanciados y Reestructurados',                                      'Refinanciados y Reestructurados',                                         'activo'),
+    ('   Atrasados',                                                            'Atrasados',                                                               'activo'),
+    ('      Vencidos',                                                          'Vencidos',                                                                'activo'),
+    ('      En Cobranza Judicial',                                              'En Cobranza Judicial',                                                    'activo'),
+    ('   Provisiones',                                                          'Provisiones (Créditos)',                                                   'activo'),
+    ('   Intereses y Comisiones no Devengados',                                 'Intereses y Comisiones no Devengados',                                     'activo'),
+    ('CUENTAS POR COBRAR NETAS DE PROVISIONES',                                 'CUENTAS POR COBRAR NETAS DE PROVISIONES',                                  'activo'),
+    ('RENDIMIENTOS POR COBRAR',                                                 'RENDIMIENTOS POR COBRAR',                                                  'activo'),
+    ('Disponible',                                                              'Disponible (Rendimientos)',                                                'activo'),
+    ('    Fondos Interbancarios',                                               'Fondos Interbancarios (Rendimientos)',                                     'activo'),
+    ('    Inversiones',                                                         'Inversiones (Rendimientos)',                                               'activo'),
+    ('    Créditos',                                                            'Créditos (Rendimientos)',                                                  'activo'),
+    ('    Cuentas por Cobrar',                                                  'Cuentas por Cobrar (Rendimientos)',                                        'activo'),
+    ('BIENES REALIZABLES, RECIBIDOS EN PAGO Y ADJUDICADOS NETOS',               'BIENES REALIZABLES, RECIBIDOS EN PAGO Y ADJUDICADOS NETOS',               'activo'),
+    ('INMUEBLES, MOBILIARIO Y EQUIPO NETO',                                     'INMUEBLES, MOBILIARIO Y EQUIPO NETO',                                     'activo'),
+    ('OTROS  ACTIVOS',                                                          'OTROS ACTIVOS',                                                           'activo'),
+    ('TOTAL ACTIVO',                                                            'TOTAL ACTIVO',                                                            'activo'),
+    # PASIVO
+    ('OBLIGACIONES CON EL PÚBLICO',                                             'OBLIGACIONES CON EL PÚBLICO',                                             'pasivo'),
+    ('     Depósitos a la Vista',                                               'Depósitos a la Vista',                                                    'pasivo'),
+    ('     Depósitos de Ahorro',                                                'Depósitos de Ahorro',                                                     'pasivo'),
+    ('     Depósitos a Plazo',                                                  'Depósitos a Plazo',                                                       'pasivo'),
+    ('          Certificados Bancarios y de Depósitos',                         'Certificados Bancarios y de Depósitos',                                    'pasivo'),
+    ('          Cuentas a Plazo',                                               'Cuentas a Plazo',                                                         'pasivo'),
+    ('          C.T.S.',                                                        'C.T.S.',                                                                  'pasivo'),
+    ('          Otros',                                                         'Otros (Depósitos a Plazo)',                                               'pasivo'),
+    ('      Depósitos Restringidos',                                            'Depósitos Restringidos',                                                  'pasivo'),
+    ('      Otras Obligaciones',                                                'Otras Obligaciones',                                                       'pasivo'),
+    ('           A la vista',                                                   'A la Vista (Otras Obligaciones)',                                          'pasivo'),
+    ('          Relacionadas con Inversiones',                                  'Relacionadas con Inversiones',                                            'pasivo'),
+    ('DEPÓSITOS DEL SISTEMA FINANCIERO Y ORGANISMOS INTERNACIONALES',           'DEPÓSITOS DEL SISTEMA FINANCIERO Y ORGANISMOS INTERNACIONALES',            'pasivo'),
+    ('    Depósitos a la Vista',                                                'Depósitos a la Vista (SF)',                                               'pasivo'),
+    ('    Depósitos de Ahorro',                                                 'Depósitos de Ahorro (SF)',                                                'pasivo'),
+    ('    Depósitos a Plazo',                                                   'Depósitos a Plazo (SF)',                                                  'pasivo'),
+    ('FONDOS INTERBANCARIOS',                                                   'FONDOS INTERBANCARIOS (Pasivo)',                                           'pasivo'),
+    ('ADEUDOS Y OBLIGACIONES  FINANCIERAS',                                     'ADEUDOS Y OBLIGACIONES FINANCIERAS',                                       'pasivo'),
+    ('     Instituciones del País',                                             'Instituciones del País',                                                  'pasivo'),
+    ('     Instituciones del Exterior y Organismos Internacionales',            'Instituciones del Exterior y Organismos Internacionales',                  'pasivo'),
+    ('OBLIGACIONES EN CIRCULACIÓN NO SUBORDINADAS',                             'OBLIGACIONES EN CIRCULACIÓN NO SUBORDINADAS',                              'pasivo'),
+    ('   Bonos de Arrendamiento Financiero',                                    'Bonos de Arrendamiento Financiero',                                        'pasivo'),
+    ('   Instrumentos Hipotecarios',                                            'Instrumentos Hipotecarios',                                               'pasivo'),
+    ('   Otros Instrumentos de Deuda',                                          'Otros Instrumentos de Deuda',                                             'pasivo'),
+    ('CUENTAS POR PAGAR ',                                                      'CUENTAS POR PAGAR',                                                        'pasivo'),
+    ('INTERESES Y OTROS GASTOS  POR PAGAR',                                    'INTERESES Y OTROS GASTOS POR PAGAR',                                       'pasivo'),
+    ('   Obligaciones con el Público',                                          'Obligaciones con el Público (Int.)',                                       'pasivo'),
+    ('   Depósitos del Sistema Financiero y Organismos Internacionales',        'Depósitos SF y OI (Int.)',                                                'pasivo'),
+    ('   Fondos Interbancarios',                                                'Fondos Interbancarios (Int.)',                                             'pasivo'),
+    ('   Adeudos y Obligaciones Financieras',                                   'Adeudos y Obligaciones Financieras (Int.)',                                'pasivo'),
+    ('   Obligaciones en Circulación no Subordinadas',                          'Obligaciones en Circulación no Subordinadas (Int.)',                       'pasivo'),
+    ('   Cuentas por Pagar',                                                    'Cuentas por Pagar (Int.)',                                                'pasivo'),
+    ('OTROS PASIVOS',                                                           'OTROS PASIVOS',                                                           'pasivo'),
+    ('PROVISIONES ',                                                            'PROVISIONES',                                                             'pasivo'),
+    ('    Créditos Indirectos',                                                 'Créditos Indirectos',                                                     'pasivo'),
+    ('    Otras Provisiones',                                                   'Otras Provisiones',                                                       'pasivo'),
+    ('OBLIGACIONES EN CIRCULACIÓN SUBORDINADAS 1/',                             'OBLIGACIONES EN CIRCULACIÓN SUBORDINADAS',                                 'pasivo'),
+    ('TOTAL PASIVO',                                                            'TOTAL PASIVO',                                                            'pasivo'),
+    ('PATRIMONIO',                                                              'PATRIMONIO',                                                              'pasivo'),
+    ('     Capital Social ',                                                    'Capital Social',                                                          'pasivo'),
+    ('     Capital Adicional',                                                  'Capital Adicional',                                                       'pasivo'),
+    ('     Reservas',                                                           'Reservas',                                                                'pasivo'),
+    ('     Ajustes al Patrimonio',                                              'Ajustes al Patrimonio',                                                   'pasivo'),
+    ('     Resultados Acumulados',                                              'Resultados Acumulados',                                                   'pasivo'),
+    ('     Resultado Neto del Ejercicio',                                       'Resultado Neto del Ejercicio',                                            'pasivo'),
+    ('TOTAL PASIVO Y PATRIMONIO',                                               'TOTAL PASIVO Y PATRIMONIO',                                               'pasivo'),
+]
+
+# Labels alternativos que aparecen en algunos tipos de entidad (sin sangría o con variación)
+ALT_LABELS = {
+    'Vigentes': 'Vigentes',
+    'Vigentes*': 'Vigentes',
+    'Refinanciados y Reestructurados': 'Refinanciados y Reestructurados',
+    'Refinanciados y Reestructurados*': 'Refinanciados y Reestructurados',
+    'Atrasados': 'Atrasados',
+    'Atrasados*': 'Atrasados',
+    'INVERSIONES NETAS DE PROVISIONES': 'INVERSIONES NETAS DE PROVISIONES',
+    'INMUEBLE, MOBILIARIO Y EQUIPO NETO': 'INMUEBLES, MOBILIARIO Y EQUIPO NETO',
+    'OTROS ACTIVOS': 'OTROS ACTIVOS',
+    'CUENTAS POR PAGAR': 'CUENTAS POR PAGAR',
+    'INTERESES Y OTROS GASTOS POR PAGAR': 'INTERESES Y OTROS GASTOS POR PAGAR',
+    'PROVISIONES': 'PROVISIONES',
+    'ADEUDOS Y OBLIGACIONES FINANCIERAS': 'ADEUDOS Y OBLIGACIONES FINANCIERAS',
+    'OBLIGACIONES EN CIRCULACIÓN SUBORDINADAS 1/': 'OBLIGACIONES EN CIRCULACIÓN SUBORDINADAS',
+    'Depósitos a la Vista': 'Depósitos a la Vista',
+    'Depósitos de Ahorro': 'Depósitos de Ahorro',
+    'Depósitos a Plazo': 'Depósitos a Plazo',
+    'Cuentas a Plazo': 'Cuentas a Plazo',
+    'C.T.S.': 'C.T.S.',
+    'Depósitos Restringidos': 'Depósitos Restringidos',
+    'Otras Obligaciones': 'Otras Obligaciones',
+    'A la Vista': 'A la Vista (Otras Obligaciones)',
+    'A la vista': 'A la Vista (Otras Obligaciones)',
+    'Relacionadas con Inversiones': 'Relacionadas con Inversiones',
+    'Instituciones del País': 'Instituciones del País',
+    'Instituciones del Exterior y Organismos Internacionales': 'Instituciones del Exterior y Organismos Internacionales',
+    'Bonos de Arrendamiento Financiero': 'Bonos de Arrendamiento Financiero',
+    'Instrumentos Hipotecarios': 'Instrumentos Hipotecarios',
+    'Otros Instrumentos de Deuda': 'Otros Instrumentos de Deuda',
+    'Obligaciones con el Público': 'Obligaciones con el Público (Int.)',
+    'Depósitos del Sistema Financiero y Organismos Internacionales': 'Depósitos SF y OI (Int.)',
+    'Fondos Interbancarios': 'Fondos Interbancarios (Int.)',
+    'Adeudos y Obligaciones Financieras': 'Adeudos y Obligaciones Financieras (Int.)',
+    'Obligaciones en Circulación no Subordinadas': 'Obligaciones en Circulación no Subordinadas (Int.)',
+    'Cuentas por Pagar': 'Cuentas por Pagar (Int.)',
+    'Créditos Indirectos': 'Créditos Indirectos',
+    'Otras Provisiones': 'Otras Provisiones',
+    'Capital Social': 'Capital Social',
+    'Capital Adicional': 'Capital Adicional',
+    'Reservas': 'Reservas',
+    'Ajustes al Patrimonio': 'Ajustes al Patrimonio',
+    'Resultados Acumulados': 'Resultados Acumulados',
+    'Resultado Neto del Ejercicio': 'Resultado Neto del Ejercicio',
+    'Disponible': 'Disponible (Rendimientos)',
+    'Inversiones': 'Inversiones (Rendimientos)',
+    'Créditos': 'Créditos (Rendimientos)',
+    'Cuentas por Cobrar': 'Cuentas por Cobrar (Rendimientos)',
+    'Tarjetas de Crédito': 'Tarjetas de Crédito',
+    'Descuentos': 'Descuentos',
+    'Factoring': 'Factoring',
+    'Préstamos': 'Préstamos',
+    'Arrendamiento Financiero': 'Arrendamiento Financiero',
+    'Hipotecarios para Vivienda': 'Hipotecarios para Vivienda',
+    'Créditos por Liquidar': 'Créditos por Liquidar',
+    'Caja': 'Caja',
+    'Bancos y Corresponsales': 'Bancos y Corresponsales',
+    'Canje': 'Canje',
+    'Certificados Bancarios y de Depósitos': 'Certificados Bancarios y de Depósitos',
+    'Intereses y Comisiones  no Devengados': 'Intereses y Comisiones no Devengados',
+    'Provisiones': None,   # ambiguo - resuelto por posición
+}
+
+# ============================================================
+# NORMALIZACIÓN DE ETIQUETAS
+# ============================================================
+def normalize(s):
+    return re.sub(r'\s+', ' ', str(s).strip().rstrip('*'))
+
+# Construir lookup normalizado desde INDICATORS_ORDERED
+RAW_TO_CANONICAL = {}
+for raw, canonical, section in INDICATORS_ORDERED:
+    nraw = normalize(raw)
+    if nraw not in RAW_TO_CANONICAL:
+        RAW_TO_CANONICAL[nraw] = canonical
+
+def get_canonical(raw_label):
+    n = normalize(raw_label)
+    if n in RAW_TO_CANONICAL:
+        return RAW_TO_CANONICAL[n]
+    stripped = raw_label.strip().rstrip('*').rstrip('/')
+    if stripped in ALT_LABELS and ALT_LABELS[stripped] is not None:
+        return ALT_LABELS[stripped]
+    return None
+
+# ============================================================
+# PARSEO DE FECHA
+# ============================================================
+def parse_date_from_sheet(sh):
+    try:
+        val = sh.iloc[2, 0]
+        if pd.notna(val) and str(val) not in ('NaT', 'nan'):
+            dt = pd.to_datetime(val)
+            return dt.strftime('%Y%m')
+    except Exception:
+        pass
+    return None
+
+def parse_date_from_filename(fname_base):
+    m = re.search(r'-([a-z]{2})(\d{4})$', fname_base, re.IGNORECASE)
+    if m:
+        mon = MONTH_MAP.get(m.group(1).lower(), '01')
+        return f"{m.group(2)}{mon}"
+    return 'DESCONOCIDA'
+
+def detect_tipo(fname_base):
+    """Detecta el tipo de entidad por el código del archivo."""
+    for code, tipo in TIPO_MAP.items():
+        if fname_base.upper().startswith(code):
+            return tipo
+    return 'Desconocido'
+
+# ============================================================
+# CONVERSIÓN XLS → XLSX (usando LibreOffice si está disponible)
+# ============================================================
+def convert_xls_to_xlsx(xls_path, tmp_dir):
+    """Convierte .xls a .xlsx y devuelve la ruta del .xlsx."""
+    fname = os.path.splitext(os.path.basename(xls_path))[0]
+    out_path = os.path.join(tmp_dir, fname + '.xlsx')
+    if os.path.exists(out_path):
+        return out_path
+    # Buscar LibreOffice
+    soffice = shutil.which('soffice') or shutil.which('libreoffice')
+    if soffice:
+        subprocess.run(
+            [soffice, '--headless', '--convert-to', 'xlsx', xls_path, '--outdir', tmp_dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(out_path):
+            return out_path
+    raise RuntimeError(
+        f"No se pudo convertir {xls_path}.\n"
+        "Instala LibreOffice para procesar archivos .xls:\n"
+        "  https://www.libreoffice.org/download/download/"
+    )
+
+# ============================================================
+# EXTRACCIÓN DE DATOS
+# ============================================================
+def extract_banks(xlsx_path, tipo, fname_base):
+    sh = pd.read_excel(xlsx_path, sheet_name=0, header=None)
+
+    date = parse_date_from_sheet(sh) or parse_date_from_filename(fname_base)
+
+    # Fila 5 = nombres de bancos
+    bank_row = sh.iloc[5].tolist()
+    SKIP = {'activo', 'pasivo', 'nan', ''}
+    bank_cols = []
+    for i, v in enumerate(bank_row):
+        sv = str(v).strip()
+        if sv.lower() not in SKIP and sv:
+            bank_cols.append((i, sv))
+    # ✅ FIX 1 VA AQUÍ
+    pasivo_start = None
+
+    for ridx in range(sh.shape[0]):
+        val = str(sh.iloc[ridx, 0]).strip()
+        if val.upper() == 'PASIVO':
+            pasivo_start = ridx
+        break
+
+    #patrimonio
+    patrimonio_start = None
+
+    for ridx in range(sh.shape[0]):
+        val = str(sh.iloc[ridx, 0]).strip().upper()
+    
+        if val == 'PASIVO':
+            pasivo_start = ridx
+        
+        elif 'PATRIMONIO' in val and patrimonio_start is None:
+            patrimonio_start = ridx
+
+    # ============================================================
+    # 🔥 NUEVO: CONTEXTO JERÁRQUICO (SOLUCIÓN REAL)
+    # ============================================================
+    context_stack = []
+    ordered_rows = []
+
+    for ridx in range(sh.shape[0]):
+        raw = str(sh.iloc[ridx, 0]).strip()
+
+        if not raw or raw == 'nan':
+            continue
+
+        canonical = get_canonical(raw)
+
+        if canonical:
+            # Detectar si es cabecera (MAYÚSCULAS)
+            if raw.isupper():
+    # solo reinicia si es un encabezado real
+                if canonical in [
+                    'ACTIVO',
+                    'PASIVO',
+                    'PATRIMONIO',
+                    'OBLIGACIONES CON EL PÚBLICO',
+                    'DEPÓSITOS DEL SISTEMA FINANCIERO Y ORGANISMOS INTERNACIONALES'
+                ]:
+                    context_stack = [canonical]
+                else:
+                    context_stack.append(canonical)
+            else:
+                # evitar duplicados consecutivos
+                if not context_stack or context_stack[-1] != canonical:
+                    context_stack.append(canonical)
+
+            full_context = " > ".join(context_stack)
+            ordered_rows.append((ridx, canonical, full_context))
+
+    # ============================================================
+    # 🔥 MAPEO INTELIGENTE (SIN PERDER "OTROS", "PROVISIONES", ETC.)
+    # ============================================================
+    canonical_ordered = [c for _, c, _ in INDICATORS_ORDERED]
+    indicator_row_map = {}
+    used_rows = set()
+
+    for target in canonical_ordered:
+        for ridx, cname, ctx in ordered_rows:
+            if ridx in used_rows:
+                continue
+
+            matched = False
+
+            # 🔥 CASOS ESPECÍFICOS (los que te fallaban)
+            if target == 'Otros (Créditos Vigentes)' and 'Vigentes' in ctx:
+                matched = True
+
+            elif target == 'Provisiones (Créditos)' and 'CRÉDITOS' in ctx:
+                matched = True
+
+            elif (
+                target == 'Otros (Depósitos a Plazo)'
+                and 'OBLIGACIONES CON EL PÚBLICO' in ctx
+                and 'Depósitos a Plazo' in ctx
+                and 'Otros' in ctx
+            ):
+                matched = True
+
+            elif target == 'Relacionadas con Inversiones' and 'Otras Obligaciones' in ctx:
+                matched = True
+
+            elif target == 'Depósitos a la Vista (SF)' and 'DEPÓSITOS DEL SISTEMA FINANCIERO' in ctx and 'Depósitos a la Vista' in ctx:
+                matched = True
+
+            elif target == 'Depósitos de Ahorro (SF)' and 'DEPÓSITOS DEL SISTEMA FINANCIERO' in ctx and 'Depósitos de Ahorro' in ctx:
+                matched = True
+
+            elif target == 'Depósitos a Plazo (SF)' and 'DEPÓSITOS DEL SISTEMA FINANCIERO' in ctx and 'Depósitos a Plazo' in ctx:
+                matched = True
+
+            elif (
+                target == 'FONDOS INTERBANCARIOS (Pasivo)'
+                and 'FONDOS INTERBANCARIOS' in raw.upper()
+                and pasivo_start is not None
+                and patrimonio_start is not None
+                and pasivo_start < ridx < patrimonio_start
+            ):
+                matched = True
+
+            elif target == 'Fondos Interbancarios (Int.)' and 'GASTOS' in ctx:
+                matched = True
+
+            # 🔹 fallback normal
+            elif cname == target:
+                matched = True
+
+            if matched:
+                indicator_row_map[target] = ridx
+                used_rows.add(ridx)
+                break
+
+    # ============================================================
+    # EXTRACCIÓN POR BANCO (igual que antes)
+    # ============================================================
+    records = []
+    for col_idx, bank_name in bank_cols:
+        total_col = col_idx + 2
+        if total_col >= sh.shape[1]:
+            total_col = col_idx
+
+        record = {
+            'N°': None,
+            'Fecha': date,
+            'Tipo': tipo,
+            'Entidad Financiera': bank_name.strip(),
+        }
+
+        for target in canonical_ordered:
+            ridx = indicator_row_map.get(target)
+            val = None
+
+            if ridx is not None and total_col < sh.shape[1]:
+                raw_val = sh.iloc[ridx, total_col]
+                try:
+                    val = float(raw_val) if pd.notna(raw_val) else None
+                except Exception:
+                    val = None
+
+            record[target] = val
+
+        records.append(record)
+
+    return records, date
+# ============================================================
+# CONSTRUCCIÓN DEL EXCEL DE SALIDA
+# ============================================================
+MAJOR_INDICATORS = {
+    'DISPONIBLE', 'FONDOS INTERBANCARIOS', 'INVERSIONES NETAS DE PROVISIONES',
+    'CRÉDITOS NETOS DE PROVISIONES Y DE INGRESOS NO DEVENGADOS',
+    'CUENTAS POR COBRAR NETAS DE PROVISIONES', 'RENDIMIENTOS POR COBRAR',
+    'BIENES REALIZABLES, RECIBIDOS EN PAGO Y ADJUDICADOS NETOS',
+    'INMUEBLES, MOBILIARIO Y EQUIPO NETO', 'OTROS ACTIVOS', 'TOTAL ACTIVO',
+    'OBLIGACIONES CON EL PÚBLICO',
+    'DEPÓSITOS DEL SISTEMA FINANCIERO Y ORGANISMOS INTERNACIONALES',
+    'FONDOS INTERBANCARIOS (Pasivo)', 'ADEUDOS Y OBLIGACIONES FINANCIERAS',
+    'OBLIGACIONES EN CIRCULACIÓN NO SUBORDINADAS', 'CUENTAS POR PAGAR',
+    'INTERESES Y OTROS GASTOS POR PAGAR', 'OTROS PASIVOS', 'PROVISIONES',
+    'OBLIGACIONES EN CIRCULACIÓN SUBORDINADAS', 'TOTAL PASIVO',
+    'PATRIMONIO', 'TOTAL PASIVO Y PATRIMONIO',
+}
+
+def build_excel(all_records, output_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Consolidado"
+
+    META_COLS = ['N°', 'Fecha', 'Tipo', 'Entidad Financiera']
+    INDICATOR_COLS = [c for _, c, _ in INDICATORS_ORDERED]
+    SECTIONS = {c: s for _, c, s in INDICATORS_ORDERED}
+    ALL_COLS = META_COLS + INDICATOR_COLS
+    total_cols = len(ALL_COLS)
+
+    C_HDR_BG   = "1F3864"
+    C_ACT_BG   = "1F3864"
+    C_PAS_BG   = "375623"
+    C_SEC_BG   = "2E75B6"
+    C_SUB_BG   = "BDD7EE"
+    C_SUB_FG   = "1F3864"
+    C_ALT1     = "DEEAF1"
+    C_ALT2     = "FFFFFF"
+
+    thin = Side(style='thin', color='CCCCCC')
+    brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Fila 1: título
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
+    c = ws.cell(1, 1, "BALANCE GENERAL CONSOLIDADO — SISTEMA FINANCIERO PERUANO  (En miles de soles)")
+    c.font      = Font(name='Arial', bold=True, size=13, color='FFFFFF')
+    c.fill      = PatternFill('solid', fgColor=C_HDR_BG)
+    c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws.row_dimensions[1].height = 26
+
+    # Fila 2: secciones ACTIVO / PASIVO
+    first_pasivo_col = None
+    for i, col in enumerate(INDICATOR_COLS):
+        if SECTIONS[col] == 'pasivo' and first_pasivo_col is None:
+            first_pasivo_col = len(META_COLS) + i + 1
+
+    for ci in range(1, len(META_COLS) + 1):
+        ws.cell(2, ci).fill = PatternFill('solid', fgColor=C_HDR_BG)
+
+    first_activo_col = len(META_COLS) + 1
+    ws.merge_cells(start_row=2, start_column=first_activo_col,
+                   end_row=2, end_column=first_pasivo_col - 1)
+    c = ws.cell(2, first_activo_col, "ACTIVO")
+    c.font      = Font(name='Arial', bold=True, size=11, color='FFFFFF')
+    c.fill      = PatternFill('solid', fgColor=C_ACT_BG)
+    c.alignment = Alignment(horizontal='center', vertical='center')
+
+    ws.merge_cells(start_row=2, start_column=first_pasivo_col,
+                   end_row=2, end_column=total_cols)
+    c = ws.cell(2, first_pasivo_col, "PASIVO Y PATRIMONIO")
+    c.font      = Font(name='Arial', bold=True, size=11, color='FFFFFF')
+    c.fill      = PatternFill('solid', fgColor=C_PAS_BG)
+    c.alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[2].height = 22
+
+    # Fila 3: cabeceras de columna
+    for ci, col in enumerate(ALL_COLS, 1):
+        c = ws.cell(3, ci, col)
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        if col in META_COLS:
+            c.font = Font(name='Arial', bold=True, size=9, color='FFFFFF')
+            c.fill = PatternFill('solid', fgColor=C_HDR_BG)
+        elif col in MAJOR_INDICATORS:
+            c.font = Font(name='Arial', bold=True, size=8, color='FFFFFF')
+            c.fill = PatternFill('solid', fgColor=C_SEC_BG)
+        else:
+            c.font = Font(name='Arial', bold=True, size=8, color=C_SUB_FG)
+            c.fill = PatternFill('solid', fgColor=C_SUB_BG)
+    ws.row_dimensions[3].height = 60
+
+    # Filas de datos
+    for ridx, row_data in enumerate(all_records, 4):
+        alt = C_ALT1 if ridx % 2 == 0 else C_ALT2
+        for ci, col in enumerate(ALL_COLS, 1):
+            val = row_data.get(col)
+            c = ws.cell(ridx, ci, val)
+            c.fill   = PatternFill('solid', fgColor=alt)
+            c.border = brd
+            if col == 'N°':
+                c.alignment = Alignment(horizontal='center', vertical='center')
+                c.font = Font(name='Arial', size=9)
+            elif col in ('Fecha', 'Tipo'):
+                c.alignment = Alignment(horizontal='center', vertical='center')
+                c.font = Font(name='Arial', size=9)
+            elif col == 'Entidad Financiera':
+                c.alignment = Alignment(horizontal='left', vertical='center')
+                c.font = Font(name='Arial', bold=True, size=9)
+            else:
+                c.alignment = Alignment(horizontal='right', vertical='center')
+                c.font = Font(name='Arial', size=9)
+                if isinstance(val, float) and val is not None:
+                    c.number_format = '#,##0.00;(#,##0.00);"-"'
+        ws.row_dimensions[ridx].height = 15
+
+    # Freeze, filtros y anchos
+    ws.freeze_panes = 'E4'
+    ws.auto_filter.ref = f"A3:{get_column_letter(total_cols)}3"
+
+    ws.column_dimensions['A'].width = 5
+    ws.column_dimensions['B'].width = 9
+    ws.column_dimensions['C'].width = 15
+    ws.column_dimensions['D'].width = 32
+    for ci in range(5, total_cols + 1):
+        ws.column_dimensions[get_column_letter(ci)].width = 16
+
+    wb.save(output_path)
+
+# ============================================================
+# LÓGICA PRINCIPAL DE CONSOLIDACIÓN
+# ============================================================
+def consolidar(input_folder, output_path, log_fn, done_fn):
+    """
+    Ejecuta la consolidación completa.
+    log_fn(msg) -> función para mostrar mensajes en la UI
+    done_fn(ok, msg) -> función para notificar fin
+    """
+    tmp_dir = os.path.join(input_folder, '_tmp_xlsx')
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    xls_files = [
+        f for f in os.listdir(input_folder)
+        if f.lower().endswith('.xls') or f.lower().endswith('.xlsx')
+    ]
+
+    if not xls_files:
+        done_fn(False, "No se encontraron archivos .xls / .xlsx en la carpeta seleccionada.")
+        return
+
+    all_records = []
+
+    for fname in sorted(xls_files):
+        fpath = os.path.join(input_folder, fname)
+        fname_base = os.path.splitext(fname)[0]
+        tipo = detect_tipo(fname_base)
+
+        log_fn(f"📄 Procesando: {fname}  →  Tipo: {tipo}")
+
+        try:
+            # Convertir si es .xls
+            if fname.lower().endswith('.xls'):
+                xlsx_path = convert_xls_to_xlsx(fpath, tmp_dir)
+            else:
+                xlsx_path = fpath
+
+            records, date = extract_banks(xlsx_path, tipo, fname_base)
+            log_fn(f"   ✅ {len(records)} entidades extraídas  |  Fecha: {date}")
+            all_records.extend(records)
+
+        except Exception as e:
+            log_fn(f"   ⚠️ Error en {fname}: {e}")
+
+    if not all_records:
+        done_fn(False, "No se pudo extraer datos de ningún archivo.")
+        return
+
+    # Numerar
+    for i, r in enumerate(all_records, 1):
+        r['N°'] = i
+
+    log_fn(f"\n📊 Total de registros: {len(all_records)}")
+    log_fn("💾 Generando Excel consolidado...")
+
+    try:
+        build_excel(all_records, output_path)
+    except Exception as e:
+        done_fn(False, f"Error al guardar el Excel: {e}")
+        return
+
+    # Limpiar tmp
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    done_fn(True, f"¡Consolidado exitosamente!\n{len(all_records)} entidades → {output_path}")
+
+
+# ============================================================
+# INTERFAZ GRÁFICA (TKINTER)
+# ============================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Consolidador Balance General - SFP")
+        self.geometry("680x520")
+        self.resizable(False, False)
+        self.configure(bg="#F0F4F8")
+        self._build_ui()
+
+    def _build_ui(self):
+        # ── Encabezado ──
+        hdr = tk.Frame(self, bg="#1F3864", height=70)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text="Consolidador de Balance General",
+                 font=("Arial", 16, "bold"), fg="white", bg="#1F3864").pack(pady=8)
+        tk.Label(hdr, text="Sistema Financiero Peruano — SBS",
+                 font=("Arial", 9), fg="#BDD7EE", bg="#1F3864").pack()
+
+        body = tk.Frame(self, bg="#F0F4F8", padx=20, pady=15)
+        body.pack(fill='both', expand=True)
+
+        # ── Carpeta de entrada ──
+        tk.Label(body, text="Carpeta con archivos XLS:", font=("Arial", 10, "bold"),
+                 bg="#F0F4F8", anchor='w').grid(row=0, column=0, sticky='w', pady=(0, 4))
+
+        self.input_var = tk.StringVar()
+        input_frame = tk.Frame(body, bg="#F0F4F8")
+        input_frame.grid(row=1, column=0, sticky='ew', pady=(0, 12))
+        tk.Entry(input_frame, textvariable=self.input_var, width=55,
+                 font=("Arial", 9)).pack(side='left', padx=(0, 8))
+        tk.Button(input_frame, text="📂 Seleccionar", command=self._browse_input,
+                  bg="#2E75B6", fg="white", font=("Arial", 9, "bold"),
+                  padx=8, relief='flat').pack(side='left')
+
+        # Tipos reconocidos
+        tipos_frame = tk.LabelFrame(body, text=" Tipos de entidad reconocidos ",
+                                    font=("Arial", 8), bg="#F0F4F8", fg="#555")
+        tipos_frame.grid(row=2, column=0, sticky='ew', pady=(0, 12))
+        tipos_text = "   ".join([f"{k} → {v}" for k, v in TIPO_MAP.items()])
+        tk.Label(tipos_frame, text=tipos_text, font=("Arial", 8),
+                 bg="#F0F4F8", fg="#333", wraplength=580, justify='left').pack(
+                     padx=8, pady=4, anchor='w')
+
+        # ── Archivo de salida ──
+        tk.Label(body, text="Guardar consolidado en:", font=("Arial", 10, "bold"),
+                 bg="#F0F4F8", anchor='w').grid(row=3, column=0, sticky='w', pady=(0, 4))
+
+        self.output_var = tk.StringVar(
+            value=os.path.join(os.path.expanduser("~"), "Desktop",
+                               "Balance_General_Consolidado.xlsx"))
+        out_frame = tk.Frame(body, bg="#F0F4F8")
+        out_frame.grid(row=4, column=0, sticky='ew', pady=(0, 12))
+        tk.Entry(out_frame, textvariable=self.output_var, width=55,
+                 font=("Arial", 9)).pack(side='left', padx=(0, 8))
+        tk.Button(out_frame, text="💾 Cambiar", command=self._browse_output,
+                  bg="#375623", fg="white", font=("Arial", 9, "bold"),
+                  padx=8, relief='flat').pack(side='left')
+
+        body.columnconfigure(0, weight=1)
+
+        # ── Botón principal ──
+        self.btn_run = tk.Button(body, text="▶  GENERAR CONSOLIDADO",
+                                 command=self._run,
+                                 bg="#1F3864", fg="white",
+                                 font=("Arial", 12, "bold"),
+                                 padx=20, pady=10, relief='flat', cursor='hand2')
+        self.btn_run.grid(row=5, column=0, pady=8)
+
+        # ── Barra de progreso ──
+        self.progress = ttk.Progressbar(body, mode='indeterminate', length=500)
+        self.progress.grid(row=6, column=0, pady=(0, 8))
+
+        # ── Log ──
+        tk.Label(body, text="Registro de procesamiento:", font=("Arial", 9),
+                 bg="#F0F4F8", anchor='w').grid(row=7, column=0, sticky='w')
+        log_frame = tk.Frame(body, bg="#F0F4F8")
+        log_frame.grid(row=8, column=0, sticky='nsew', pady=(4, 0))
+        body.rowconfigure(8, weight=1)
+        scrollbar = tk.Scrollbar(log_frame)
+        scrollbar.pack(side='right', fill='y')
+        self.log_box = tk.Text(log_frame, height=8, font=("Consolas", 8),
+                               bg="#1E1E1E", fg="#D4D4D4",
+                               yscrollcommand=scrollbar.set, wrap='word')
+        self.log_box.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=self.log_box.yview)
+
+    def _browse_input(self):
+        folder = filedialog.askdirectory(title="Seleccionar carpeta con archivos XLS")
+        if folder:
+            self.input_var.set(folder)
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(
+            title="Guardar como",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile="Balance_General_Consolidado.xlsx"
+        )
+        if path:
+            self.output_var.set(path)
+
+    def _log(self, msg):
+        self.log_box.insert('end', msg + '\n')
+        self.log_box.see('end')
+        self.update_idletasks()
+
+    def _run(self):
+        input_folder = self.input_var.get().strip()
+        output_path  = self.output_var.get().strip()
+
+        if not input_folder or not os.path.isdir(input_folder):
+            messagebox.showerror("Error", "Selecciona una carpeta válida.")
+            return
+        if not output_path:
+            messagebox.showerror("Error", "Indica dónde guardar el archivo de salida.")
+            return
+
+        self.log_box.delete('1.0', 'end')
+        self.btn_run.config(state='disabled')
+        self.progress.start(10)
+
+        def _thread():
+            consolidar(
+                input_folder=input_folder,
+                output_path=output_path,
+                log_fn=self._log,
+                done_fn=self._done
+            )
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _done(self, ok, msg):
+        self.progress.stop()
+        self.btn_run.config(state='normal')
+        if ok:
+            self._log(f"\n✅ {msg}")
+            messagebox.showinfo("¡Listo!", msg)
+            # Abrir carpeta de salida
+            out_dir = os.path.dirname(self.output_var.get())
+            if os.path.isdir(out_dir):
+                try:
+                    os.startfile(out_dir)          # Windows
+                except AttributeError:
+                    subprocess.Popen(['xdg-open', out_dir])  # Linux/Mac
+        else:
+            self._log(f"\n❌ {msg}")
+            messagebox.showerror("Error", msg)
+
+
+# ============================================================
+# ENTRADA
+# ============================================================
+if __name__ == '__main__':
+    app = App()
+    app.mainloop()
