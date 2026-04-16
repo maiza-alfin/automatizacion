@@ -1,0 +1,72 @@
+"antes de ejecutar-> instalar en la terminal pip install pywin32" 
+import os
+import win32com.client
+
+def convert_xls_to_xlsx(xls_path, excel):
+    try:
+        wb = excel.Workbooks.Open(xls_path)
+
+        xlsx_path = os.path.splitext(xls_path)[0] + ".xlsx"
+
+        wb.SaveAs(xlsx_path, FileFormat=51)  # 51 = .xlsx
+        wb.Close(False)
+
+        return xlsx_path, None
+
+    except Exception as e:
+        return None, str(e)
+
+
+def convertir_carpeta(carpeta, eliminar_original=False):
+    archivos = [f for f in os.listdir(carpeta) if f.lower().endswith('.xls')]
+
+    if not archivos:
+        print("⚠️ No hay archivos .xls en la carpeta.")
+        return
+
+    print(f"📂 Carpeta: {carpeta}")
+    print(f"📄 Archivos encontrados: {len(archivos)}\n")
+
+    excel = win32com.client.Dispatch("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+
+    convertidos = 0
+    errores = 0
+
+    for i, fname in enumerate(archivos, 1):
+        ruta = os.path.join(carpeta, fname)
+        print(f"[{i}/{len(archivos)}] 🔄 Convirtiendo: {fname}")
+
+        nuevo, err = convert_xls_to_xlsx(ruta, excel)
+
+        if err:
+            print(f"   ❌ Error: {err}")
+            errores += 1
+        else:
+            print(f"   ✅ Convertido: {os.path.basename(nuevo)}")
+            convertidos += 1
+
+            if eliminar_original:
+                try:
+                    os.remove(ruta)
+                    print("   🗑️ Original eliminado")
+                except:
+                    print("   ⚠️ No se pudo eliminar el original")
+
+    excel.Quit()
+
+    print("\n==============================")
+    print(f"✅ Convertidos: {convertidos}")
+    print(f"❌ Errores: {errores}")
+    print("==============================")
+
+
+# ▶ EJECUCIÓN
+if __name__ == "__main__":
+    carpeta = input("📂 Ingresa la ruta de la carpeta: ").strip()
+
+    if not os.path.isdir(carpeta):
+        print("❌ Carpeta inválida")
+    else:
+        convertir_carpeta(carpeta, eliminar_original=False)
