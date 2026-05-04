@@ -1,0 +1,767 @@
+"""
+Ojo: consolida todo cuando suben todas las carpetas porque las filas cambian. 
+Consolidador de Indicadores Financieros SBS
+Soporta: Bancos (B-2401), Financieras (B-3301), Cajas Municipales (C-1301),
+         Cajas Rurales (C-2301), EDPYMEs (C-4301)
+
+Mapeo exhaustivo de TODOS los indicadores encontrados en los XLS del SBS,
+con sus variantes de nombre por tipo de entidad.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import os
+import re
+from datetime import datetime
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+# =============================================================================
+# INDICADORES CANONICOS — orden final en la tabla consolidada
+# Cada tupla: (nombre_canonico, categoria)
+# =============================================================================
+INDICADORES_ORDEN = [
+    # SOLVENCIA
+    ("Ratio de Capital Global",                                              "SOLVENCIA"),
+    ("Pasivo Total / Capital Social y Reservas",                             "SOLVENCIA"),
+    # CALIDAD DE ACTIVOS
+    ("Creditos Atrasados (SBS) / Creditos Directos",                        "CALIDAD DE ACTIVOS"),
+    ("Creditos Atrasados >90 dias / Creditos Directos",                     "CALIDAD DE ACTIVOS"),
+    ("Creditos Refinanciados y Reestructurados / Creditos Directos",        "CALIDAD DE ACTIVOS"),
+    ("Creditos Atrasados MN (SBS) / Creditos Directos MN",                  "CALIDAD DE ACTIVOS"),
+    ("Creditos Atrasados ME (SBS) / Creditos Directos ME",                  "CALIDAD DE ACTIVOS"),
+    ("Provisiones / Creditos Atrasados",                                     "CALIDAD DE ACTIVOS"),
+    ("Cartera de Alto Riesgo / Creditos Directos",                           "CALIDAD DE ACTIVOS"),
+    ("Cartera Atrasada Ajustada",                                            "CALIDAD DE ACTIVOS"),
+    ("Cartera de Alto Riesgo Ajustada",                                      "CALIDAD DE ACTIVOS"),
+    # EFICIENCIA Y GESTION
+    ("Gastos de Administracion / Activo Productivo Promedio",               "EFICIENCIA Y GESTION"),
+    ("Gastos de Administracion / Creditos Directos e Indirectos Promedio",  "EFICIENCIA Y GESTION"),
+    ("Gastos de Operacion / Margen Financiero Total",                        "EFICIENCIA Y GESTION"),
+    ("Ingresos Financieros / Ingresos Totales",                              "EFICIENCIA Y GESTION"),
+    ("Ingresos Financieros Anualizados / Activo Productivo Promedio",       "EFICIENCIA Y GESTION"),
+    ("Creditos Directos / Personal (S/ Miles)",                              "EFICIENCIA Y GESTION"),
+    ("Creditos Directos / Numero de Oficinas (S/ Miles)",                    "EFICIENCIA Y GESTION"),
+    ("Depositos / Numero de Oficinas (S/ Miles)",                            "EFICIENCIA Y GESTION"),
+    ("Depositos / Creditos Directos",                                        "EFICIENCIA Y GESTION"),
+    # RENTABILIDAD
+    ("Utilidad Neta Anualizada / Patrimonio Promedio",                       "RENTABILIDAD"),
+    ("Utilidad Neta Anualizada / Activo Promedio",                           "RENTABILIDAD"),
+    # LIQUIDEZ
+    ("Ratio de Liquidez MN",                                                 "LIQUIDEZ"),
+    ("Ratio de Liquidez ME",                                                 "LIQUIDEZ"),
+    ("Caja y Bancos MN / Obligaciones Vista MN",                             "LIQUIDEZ"),
+    ("Caja y Bancos ME / Obligaciones Vista ME",                             "LIQUIDEZ"),
+    ("Adeudos / Pasivo Total",                                               "LIQUIDEZ"),
+    ("Disponible / Activo Total",                                            "LIQUIDEZ"),
+    # POSICION EN MONEDA EXTRANJERA
+    ("Posicion Global ME / Patrimonio Efectivo",                             "POSICION EN MONEDA EXTRANJERA"),
+]
+
+INDICADORES = {k: v for k, v in INDICADORES_ORDEN}
+
+
+# =============================================================================
+# PALABRAS CLAVE QUE INDICAN FIN DE TABLA (notas al pie)
+# =============================================================================
+STOP_STARTS = (
+    "nota:",
+    "los valores anualizados",
+    "* para los",
+    "** para los",
+    "** informacion",
+    "** un credito",
+    "**** informacion",
+    "*** este ratio",
+    "1/ para",
+    "2/ mediante",
+    "a partir de enero",
+    "un credito se considera",
+    "los creditos",
+)
+
+
+# =============================================================================
+# UTILIDADES
+# =============================================================================
+def sa(text: str) -> str:
+    """Strip accents + lowercase para comparaciones robustas."""
+    _map = str.maketrans(
+        "áéíóúÁÉÍÓÚñÑüÜ",
+        "aeiouAEIOUnNuU"
+    )
+    return text.translate(_map).lower().strip()
+
+
+def es_stop(texto: str) -> bool:
+    t = sa(texto)
+    return any(t.startswith(sw) for sw in STOP_STARTS)
+
+
+def limpiar_nombre_entidad(val) -> str:
+    if not isinstance(val, str):
+        return ""
+    v = re.sub(r'\s+', ' ', val).strip()
+    v = re.sub(r'\s*\d+/$', '', v).strip()   # quitar "1/" "2/"
+    return v
+
+
+def es_total_o_vacio(nombre: str) -> bool:
+    n = nombre.lower().strip()
+    if not n:
+        return True
+    PREFIJOS_TOTAL = (
+        "total", "cmcp", "cmac piura1",
+    )
+    return any(n.startswith(p) for p in PREFIJOS_TOTAL)
+
+
+def extraer_periodo(df: pd.DataFrame) -> str:
+    for i in range(6):
+        for j in range(min(df.shape[1], 3)):
+            v = df.iloc[i, j]
+            if isinstance(v, datetime):
+                return v.strftime("%Y-%m-%d")
+            if isinstance(v, str):
+                m = re.search(r'(\d{4}-\d{2}-\d{2})', v)
+                if m:
+                    return m.group(1)
+    return "N/D"
+
+
+# =============================================================================
+# NORMALIZACION DE INDICADORES
+# Retorna (nombre_canonico, fecha_ratio_capital_global | None)
+# =============================================================================
+def normalizar_indicador(texto: str):
+    if not isinstance(texto, str) or not texto.strip():
+        return None, None
+
+    raw = texto.strip()
+    t   = sa(raw)
+
+    if es_stop(raw):
+        return None, None
+
+    # ── SOLVENCIA ─────────────────────────────────────────────────────────────
+    if "ratio de capital global" in t:
+        fecha = None
+        m = re.search(r'al\s+(\d{1,2}/\d{2}/\d{4})', raw, re.I)
+        if not m:
+            m = re.search(r'(\d{2}/\d{2}/\d{4})', raw)
+        if m:
+            fecha = m.group(1)
+        return "Ratio de Capital Global", fecha
+
+    if "pasivo total" in t and "capital social" in t:
+        return "Pasivo Total / Capital Social y Reservas", None
+
+    # ── CALIDAD DE ACTIVOS ────────────────────────────────────────────────────
+    # Orden importante: primero los más específicos
+    if "creditos atrasados" in t and "90" in t:
+        return "Creditos Atrasados >90 dias / Creditos Directos", None
+
+    if "creditos atrasados" in t and "mn" in t and "me" not in t:
+        return "Creditos Atrasados MN (SBS) / Creditos Directos MN", None
+
+    if "creditos atrasados" in t and "me" in t and "mn" not in t:
+        return "Creditos Atrasados ME (SBS) / Creditos Directos ME", None
+
+    if "creditos atrasados" in t and ("criterio sbs" in t or "sbs" in t):
+        # sin MN ni ME ni 90 → indicador base
+        return "Creditos Atrasados (SBS) / Creditos Directos", None
+
+    if "refinanciados" in t and "reestructurados" in t:
+        return "Creditos Refinanciados y Reestructurados / Creditos Directos", None
+
+    if "provisiones" in t and "creditos atrasados" in t:
+        return "Provisiones / Creditos Atrasados", None
+
+    # Cartera — primero "ajustada" para no confundir con la base
+    if "cartera de alto riesgo ajustada" in t:
+        return "Cartera de Alto Riesgo Ajustada", None
+
+    if "cartera atrasada ajustada" in t:
+        return "Cartera Atrasada Ajustada", None
+
+    if "cartera de alto riesgo" in t and "ajustada" not in t:
+        return "Cartera de Alto Riesgo / Creditos Directos", None
+
+    # ── EFICIENCIA Y GESTION ─────────────────────────────────────────────────
+    # "Gastos de Administración Anualizados/ Créditos Directos e Indirectos"  (Cajas/EDPYME)
+    if "gastos de administracion" in t and ("creditos directos" in t and "indirectos" in t):
+        return "Gastos de Administracion / Creditos Directos e Indirectos Promedio", None
+
+    # "Gastos de Administración Anualizados / Activo Productivo Promedio"     (Bancos/Financ)
+    if "gastos de administracion" in t and "activo productivo" in t:
+        return "Gastos de Administracion / Activo Productivo Promedio", None
+
+    # "Gastos de Operación / Margen Financiero Total"
+    if "gastos de operacion" in t and "margen financiero" in t:
+        return "Gastos de Operacion / Margen Financiero Total", None
+
+    # "Ingresos Financieros / Ingresos Totales"  (Bancos/Financ)
+    if "ingresos financieros" in t and "ingresos totales" in t:
+        return "Ingresos Financieros / Ingresos Totales", None
+
+    # "Ingresos Financieros Anualizados / Activo Productivo Promedio"
+    if "ingresos financieros" in t and "activo productivo" in t:
+        return "Ingresos Financieros Anualizados / Activo Productivo Promedio", None
+
+    # "Créditos Directos / Empleados"  o  "/ Personal"
+    if "creditos directos" in t and ("personal" in t or "empleados" in t):
+        return "Creditos Directos / Personal (S/ Miles)", None
+
+    # "Créditos Directos / Número de Oficinas"  (Cajas)
+    if "creditos directos" in t and "oficinas" in t:
+        return "Creditos Directos / Numero de Oficinas (S/ Miles)", None
+
+    # "Depósitos / Número de Oficinas"  (Bancos/Financ)
+    if "depositos" in t and "oficinas" in t:
+        return "Depositos / Numero de Oficinas (S/ Miles)", None
+
+    # "Depósitos / Créditos Directos"  (Cajas)
+    if "depositos" in t and "creditos directos" in t:
+        return "Depositos / Creditos Directos", None
+
+    # ── RENTABILIDAD ─────────────────────────────────────────────────────────
+    if "utilidad" in t and "patrimonio" in t:
+        return "Utilidad Neta Anualizada / Patrimonio Promedio", None
+
+    if "utilidad" in t and "activo" in t and "patrimonio" not in t:
+        return "Utilidad Neta Anualizada / Activo Promedio", None
+
+    # ── LIQUIDEZ ─────────────────────────────────────────────────────────────
+    # "Ratio de Liquidez MN" / "Ratio de Liquidez en M.N."
+    if ("ratio de liquidez" in t or "liquidez en m" in t) and ("mn" in t or "m.n" in t):
+        return "Ratio de Liquidez MN", None
+
+    if ("ratio de liquidez" in t or "liquidez en m" in t) and ("me" in t or "m.e" in t):
+        return "Ratio de Liquidez ME", None
+
+    if "caja y bancos" in t and "mn" in t:
+        return "Caja y Bancos MN / Obligaciones Vista MN", None
+
+    if "caja y bancos" in t and "me" in t:
+        return "Caja y Bancos ME / Obligaciones Vista ME", None
+
+    if "adeudos" in t and "pasivo total" in t:
+        return "Adeudos / Pasivo Total", None
+
+    if "disponible" in t and "activo total" in t:
+        return "Disponible / Activo Total", None
+
+    # ── POSICION EN MONEDA EXTRANJERA ────────────────────────────────────────
+    if "posicion global" in t and ("patrimonio efectivo" in t or "m.e" in t or "me" in t):
+        return "Posicion Global ME / Patrimonio Efectivo", None
+
+    return None, None
+
+
+# =============================================================================
+# EXTRACCION GENERICA
+# =============================================================================
+def extraer_entidades_y_datos(df, fila_entidades, fila_inicio_datos,
+                               tipo, periodo, col_separador=None):
+    rows = []
+
+    # Mapa col_idx -> nombre_entidad
+    entidades = {}
+    for col_idx, val in enumerate(df.iloc[fila_entidades]):
+        if col_separador is not None and col_idx == col_separador:
+            continue
+        nombre = limpiar_nombre_entidad(val)
+        if nombre and not es_total_o_vacio(nombre):
+            entidades[col_idx] = nombre
+
+    # Recorrer filas de indicadores
+    for row_idx in range(fila_inicio_datos, df.shape[0]):
+        raw  = df.iloc[row_idx, 0]
+        texto = str(raw).strip() if pd.notna(raw) else ""
+
+        if es_stop(texto):
+            break
+
+        indicador, fecha_rcg = normalizar_indicador(texto)
+        if not indicador:
+            continue
+
+        for col_idx, entidad in entidades.items():
+            val = df.iloc[row_idx, col_idx]
+            if pd.notna(val):
+                try:
+                    valor = float(val)
+                except (ValueError, TypeError):
+                    continue
+                rows.append({
+                    "Tipo":                       tipo,
+                    "Entidad":                    entidad,
+                    "Periodo":                    periodo,
+                    "Fecha Ratio Capital Global": fecha_rcg or "",
+                    "Indicador":                  indicador,
+                    "Categoria":                  INDICADORES.get(indicador, "OTRO"),
+                    "Valor":                      valor,
+                })
+    return rows
+
+
+# =============================================================================
+# PROCESADORES POR TIPO
+# =============================================================================
+def _buscar_fila_entidades(df, rango=(4, 9), min_nombres=2):
+    for i in range(*rango):
+        nombres = [limpiar_nombre_entidad(v) for v in df.iloc[i] if isinstance(v, str)]
+        validos = [n for n in nombres if n and len(n) > 3 and not es_total_o_vacio(n)]
+        if len(validos) >= min_nombres:
+            return i
+    return rango[0]
+
+
+def procesar_banco(filename):
+    """B-2401: tabla duplicada en dos bloques (sep col 9)."""
+    xl = pd.ExcelFile(filename)
+    df = pd.read_excel(filename, sheet_name=xl.sheet_names[0], header=None)
+    periodo = extraer_periodo(df)
+    fila = _buscar_fila_entidades(df, (4, 8), min_nombres=5)
+    return extraer_entidades_y_datos(df, fila, fila + 2, "Banco", periodo, col_separador=9)
+
+
+def procesar_financiera(filename):
+    """B-3301: similar a banco."""
+    xl = pd.ExcelFile(filename)
+    df = pd.read_excel(filename, sheet_name=xl.sheet_names[0], header=None)
+    periodo = extraer_periodo(df)
+    fila = _buscar_fila_entidades(df, (4, 8), min_nombres=2)
+    return extraer_entidades_y_datos(df, fila, fila + 2, "Financiera", periodo, col_separador=9)
+
+
+def procesar_caja_municipal(filename):
+    """C-1301: entidades fila 4, datos fila 6."""
+    xl = pd.ExcelFile(filename)
+    df = pd.read_excel(filename, sheet_name=xl.sheet_names[0], header=None)
+    periodo = extraer_periodo(df)
+    return extraer_entidades_y_datos(df, 4, 6, "Caja Municipal", periodo)
+
+
+def procesar_caja_rural(filename):
+    """C-2301: entidades fila 4, datos fila 6."""
+    xl = pd.ExcelFile(filename)
+    df = pd.read_excel(filename, sheet_name=xl.sheet_names[0], header=None)
+    periodo = extraer_periodo(df)
+    return extraer_entidades_y_datos(df, 4, 6, "Caja Rural", periodo)
+
+
+def procesar_edpyme(filename):
+    """C-4301: entidades fila 4, datos fila 6."""
+    xl = pd.ExcelFile(filename)
+    df = pd.read_excel(filename, sheet_name=xl.sheet_names[0], header=None)
+    periodo = extraer_periodo(df)
+    return extraer_entidades_y_datos(df, 4, 6, "EDPYME", periodo)
+
+
+PROCESADORES = {
+    "B-2401": procesar_banco,
+    "B-3301": procesar_financiera,
+    "C-1301": procesar_caja_municipal,
+    "C-2301": procesar_caja_rural,
+    "C-4301": procesar_edpyme,
+}
+
+
+def detectar_procesador(filename):
+    base = os.path.basename(filename).upper()
+    for prefijo, func in PROCESADORES.items():
+        if prefijo in base:
+            return func
+    return None
+
+
+# =============================================================================
+# CONSOLIDACION
+# =============================================================================
+def consolidar(archivos):
+    all_rows = []
+    for f in archivos:
+        proc = detectar_procesador(f)
+        if proc:
+            all_rows.extend(proc(f))
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df_long = pd.DataFrame(all_rows)
+
+    # Extraer fecha Ratio Capital Global (solo existe en B-2401/B-3301)
+    mask_rcg = (
+        (df_long["Indicador"] == "Ratio de Capital Global") &
+        (df_long["Fecha Ratio Capital Global"] != "")
+    )
+    fecha_rcg = (
+        df_long[mask_rcg][["Tipo", "Entidad", "Periodo", "Fecha Ratio Capital Global"]]
+        .drop_duplicates(subset=["Tipo", "Entidad", "Periodo"])
+    )
+
+    # Pivot: filas = (Tipo, Entidad, Periodo), columnas = Indicador
+    df_pivot = df_long.pivot_table(
+        index=["Tipo", "Entidad", "Periodo"],
+        columns="Indicador",
+        values="Valor",
+        aggfunc="first",
+    ).reset_index()
+
+    # Merge fecha RCG
+    df_pivot = df_pivot.merge(fecha_rcg, on=["Tipo", "Entidad", "Periodo"], how="left")
+    df_pivot["Fecha Ratio Capital Global"] = (
+        df_pivot["Fecha Ratio Capital Global"].fillna("")
+    )
+
+    # Ordenar columnas: meta primero, luego indicadores en orden canónico
+    meta  = ["Tipo", "Entidad", "Periodo", "Fecha Ratio Capital Global"]
+    indic = [k for k, _ in INDICADORES_ORDEN if k in df_pivot.columns]
+    otros = [c for c in df_pivot.columns if c not in meta + indic]
+    df_pivot = df_pivot[meta + indic + otros]
+
+    # Ordenar filas por tipo y nombre
+    tipo_ord = {
+        "Banco": 1, "Financiera": 2,
+        "Caja Municipal": 3, "Caja Rural": 4, "EDPYME": 5,
+    }
+    df_pivot["_ord"] = df_pivot["Tipo"].map(tipo_ord).fillna(99)
+    df_pivot = (
+        df_pivot.sort_values(["_ord", "Entidad"])
+        .drop(columns=["_ord"])
+        .reset_index(drop=True)
+    )
+    return df_pivot
+
+
+# =============================================================================
+# EXPORTAR EXCEL
+# =============================================================================
+def exportar_excel(df, output_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Indicadores Consolidados"
+
+    C_HDR  = "1F3864"
+    C_HDR2 = "2E75B6"
+    TIPO_FILL = {
+        "Banco":          "DDEEFF",
+        "Financiera":     "E2EFDA",
+        "Caja Municipal": "FFF2CC",
+        "Caja Rural":     "FCE4D6",
+        "EDPYME":         "F4CCFF",
+    }
+    thin = Side(border_style="thin", color="CCCCCC")
+    brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    meta_cols  = ["Tipo", "Entidad", "Periodo", "Fecha Ratio Capital Global"]
+    indic_cols = [c for c in df.columns if c not in meta_cols]
+    all_cols   = meta_cols + indic_cols
+    N_META     = len(meta_cols)
+
+    # ── Fila 1: grupos ────────────────────────────────────────────────────────
+    for c in range(1, N_META + 1):
+        cell = ws.cell(row=1, column=c, value="")
+        cell.fill   = PatternFill("solid", start_color=C_HDR)
+        cell.border = brd
+
+    grupos: dict[str, list[int]] = {}
+    for col_num, col_name in enumerate(indic_cols, start=N_META + 1):
+        cat = INDICADORES.get(col_name, "OTRO")
+        grupos.setdefault(cat, []).append(col_num)
+
+    for cat, cols in grupos.items():
+        s, e = cols[0], cols[-1]
+        if s != e:
+            ws.merge_cells(start_row=1, start_column=s, end_row=1, end_column=e)
+        cell = ws.cell(row=1, column=s, value=cat)
+        cell.font      = Font(bold=True, color="FFFFFF", size=10)
+        cell.fill      = PatternFill("solid", start_color=C_HDR)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = brd
+
+    # ── Fila 2: nombres de columnas ───────────────────────────────────────────
+    etiquetas_meta = {
+        "Tipo":                       "Tipo",
+        "Entidad":                    "Entidad",
+        "Periodo":                    "Periodo",
+        "Fecha Ratio Capital Global": "Fecha Ratio\nCapital Global",
+    }
+    for col_num, col_name in enumerate(all_cols, start=1):
+        label = etiquetas_meta.get(col_name, col_name)
+        cell  = ws.cell(row=2, column=col_num, value=label)
+        cell.font      = Font(bold=True, color="FFFFFF", size=9)
+        cell.fill      = PatternFill("solid", start_color=C_HDR2)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = brd
+
+    # ── Filas de datos ────────────────────────────────────────────────────────
+    for row_num, row_data in enumerate(df[all_cols].itertuples(index=False), start=3):
+        tipo = row_data[0]
+        fill = PatternFill("solid", start_color=TIPO_FILL.get(tipo, "FFFFFF"))
+        for col_num, val in enumerate(row_data, start=1):
+            cell = ws.cell(row=row_num, column=col_num, value=val)
+            cell.border = brd
+            cell.fill   = fill
+            if col_num <= N_META:
+                cell.font      = Font(bold=(col_num <= 2), size=9)
+                cell.alignment = Alignment(vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+                if isinstance(val, float):
+                    cell.number_format = "#,##0.00"
+                cell.font = Font(size=9)
+
+    # ── Anchos ────────────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 12
+    ws.column_dimensions["D"].width = 16
+    for c in range(N_META + 1, len(all_cols) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 20
+
+    ws.row_dimensions[1].height = 32
+    ws.row_dimensions[2].height = 55
+    for r in range(3, len(df) + 3):
+        ws.row_dimensions[r].height = 16
+
+    ws.freeze_panes = "E3"
+
+    # ── Leyenda ───────────────────────────────────────────────────────────────
+    row_ley = len(df) + 4
+    c = ws.cell(row=row_ley, column=1, value="LEYENDA:")
+    c.font = Font(bold=True, size=9)
+    for i, (tipo, color) in enumerate(TIPO_FILL.items(), start=1):
+        cell = ws.cell(row=row_ley + i, column=1, value=tipo)
+        cell.fill   = PatternFill("solid", start_color=color)
+        cell.font   = Font(size=9)
+        cell.border = brd
+
+    # ── Hoja 2: Para SQL ──────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Para_SQL")
+    sql_cols = [
+        "Tipo", "Entidad", "Periodo", "Fecha Ratio Capital Global",
+        "Categoria", "Indicador", "Valor",
+    ]
+    df_melted = df.melt(
+        id_vars=meta_cols, var_name="Indicador", value_name="Valor"
+    ).dropna(subset=["Valor"])
+    df_melted["Categoria"] = df_melted["Indicador"].map(INDICADORES)
+    df_melted = df_melted[sql_cols]
+
+    for col_num, h in enumerate(sql_cols, start=1):
+        cell = ws2.cell(row=1, column=col_num, value=h)
+        cell.font  = Font(bold=True, color="FFFFFF")
+        cell.fill  = PatternFill("solid", start_color=C_HDR)
+        cell.border = brd
+
+    for row_num, row_data in enumerate(df_melted.itertuples(index=False), start=2):
+        for col_num, val in enumerate(row_data, start=1):
+            cell = ws2.cell(row=row_num, column=col_num, value=val)
+            cell.border = brd
+
+    ws2.column_dimensions["A"].width = 16
+    ws2.column_dimensions["B"].width = 30
+    ws2.column_dimensions["C"].width = 12
+    ws2.column_dimensions["D"].width = 16
+    ws2.column_dimensions["E"].width = 24
+    ws2.column_dimensions["F"].width = 68
+    ws2.column_dimensions["G"].width = 14
+    ws2.freeze_panes = "A2"
+
+    wb.save(output_path)
+
+
+# =============================================================================
+# INTERFAZ GRAFICA
+# =============================================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Consolidador Indicadores SBS")
+        self.geometry("760x600")
+        self.resizable(True, True)
+        self.configure(bg="#F0F4F8")
+        self.archivos: list[str] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        # Header
+        hdr = tk.Frame(self, bg="#1F3864", pady=14)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Consolidador de Indicadores Financieros SBS",
+                 font=("Arial", 15, "bold"), bg="#1F3864", fg="white").pack()
+        tk.Label(hdr,
+                 text="Bancos  |  Financieras  |  Cajas Municipales  |  Cajas Rurales  |  EDPYMEs",
+                 font=("Arial", 9), bg="#1F3864", fg="#A8C4E0").pack(pady=(2, 0))
+
+        body = tk.Frame(self, bg="#F0F4F8", padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+
+        # Archivos
+        frm_top = tk.LabelFrame(body, text=" Archivos XLS a consolidar ",
+                                font=("Arial", 10, "bold"),
+                                bg="#F0F4F8", fg="#1F3864", padx=10, pady=8)
+        frm_top.pack(fill="x", pady=(0, 10))
+
+        btn_row = tk.Frame(frm_top, bg="#F0F4F8")
+        btn_row.pack(fill="x", pady=4)
+        for txt, cmd in [
+            ("  Agregar archivos XLS", self.agregar_archivos),
+            ("  Agregar carpeta",      self.agregar_carpeta),
+        ]:
+            tk.Button(btn_row, text=txt, command=cmd,
+                      bg="#2E75B6", fg="white", font=("Arial", 10, "bold"),
+                      relief="flat", padx=12, pady=6, cursor="hand2"
+                      ).pack(side="left", padx=(0, 8))
+        tk.Button(btn_row, text="  Limpiar lista", command=self.limpiar_lista,
+                  bg="#C0392B", fg="white", font=("Arial", 10),
+                  relief="flat", padx=10, pady=6, cursor="hand2"
+                  ).pack(side="right")
+
+        lf = tk.Frame(frm_top, bg="#F0F4F8")
+        lf.pack(fill="both", expand=True, pady=4)
+        sb = ttk.Scrollbar(lf)
+        sb.pack(side="right", fill="y")
+        self.listbox = tk.Listbox(lf, yscrollcommand=sb.set, height=8,
+                                  font=("Consolas", 9), bg="white", fg="#333",
+                                  selectbackground="#2E75B6", relief="flat",
+                                  borderwidth=1, highlightthickness=1,
+                                  highlightbackground="#CCCCCC")
+        self.listbox.pack(fill="both", expand=True)
+        sb.config(command=self.listbox.yview)
+        self.lbl_count = tk.Label(frm_top, text="0 archivos cargados",
+                                   font=("Arial", 9), bg="#F0F4F8", fg="#666")
+        self.lbl_count.pack(anchor="w")
+
+        # Salida
+        frm_out = tk.LabelFrame(body, text=" Archivo de salida ",
+                                font=("Arial", 10, "bold"),
+                                bg="#F0F4F8", fg="#1F3864", padx=10, pady=8)
+        frm_out.pack(fill="x", pady=(0, 10))
+        out_row = tk.Frame(frm_out, bg="#F0F4F8")
+        out_row.pack(fill="x")
+        default = os.path.join(os.path.expanduser("~"), "indicadores_consolidados.xlsx")
+        self.var_output = tk.StringVar(value=default)
+        tk.Entry(out_row, textvariable=self.var_output, font=("Arial", 9),
+                 relief="flat", borderwidth=1, highlightthickness=1,
+                 highlightbackground="#CCCCCC"
+                 ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        tk.Button(out_row, text="...", command=self.elegir_salida,
+                  bg="#5D6D7E", fg="white", font=("Arial", 10),
+                  relief="flat", padx=10, cursor="hand2").pack(side="right")
+
+        # Log
+        frm_log = tk.LabelFrame(body, text=" Log ",
+                                font=("Arial", 10, "bold"),
+                                bg="#F0F4F8", fg="#1F3864", padx=10, pady=6)
+        frm_log.pack(fill="both", expand=True, pady=(0, 10))
+        self.log_text = tk.Text(frm_log, height=6, font=("Consolas", 8),
+                                bg="#1E1E1E", fg="#D4D4D4", relief="flat",
+                                state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+
+        tk.Button(body, text="   CONSOLIDAR",
+                  command=self.consolidar,
+                  bg="#1D6F42", fg="white", font=("Arial", 12, "bold"),
+                  relief="flat", padx=20, pady=10, cursor="hand2").pack(fill="x")
+
+    # ── Helpers UI ────────────────────────────────────────────────────────────
+    def log(self, msg):
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", f"  {msg}\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+        self.update()
+
+    def agregar_archivos(self):
+        files = filedialog.askopenfilenames(
+            title="Seleccionar archivos XLS",
+            filetypes=[("Excel .xls", "*.xls"), ("Excel .xlsx", "*.xlsx"), ("Todos", "*.*")]
+        )
+        for f in files:
+            if f not in self.archivos:
+                self.archivos.append(f)
+                self.listbox.insert("end", os.path.basename(f))
+        self.lbl_count.config(text=f"{len(self.archivos)} archivos cargados")
+
+    def agregar_carpeta(self):
+        folder = filedialog.askdirectory(title="Seleccionar carpeta con archivos XLS")
+        if not folder:
+            return
+        for fname in sorted(os.listdir(folder)):
+            if fname.lower().endswith((".xls", ".xlsx")):
+                full = os.path.join(folder, fname)
+                if full not in self.archivos:
+                    self.archivos.append(full)
+                    self.listbox.insert("end", fname)
+        self.lbl_count.config(text=f"{len(self.archivos)} archivos cargados")
+
+    def limpiar_lista(self):
+        self.archivos = []
+        self.listbox.delete(0, "end")
+        self.lbl_count.config(text="0 archivos cargados")
+
+    def elegir_salida(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile="indicadores_consolidados.xlsx"
+        )
+        if path:
+            self.var_output.set(path)
+
+    def consolidar(self):
+        if not self.archivos:
+            messagebox.showwarning("Sin archivos", "Agrega archivos XLS primero.")
+            return
+        output = self.var_output.get().strip()
+        if not output:
+            messagebox.showwarning("Sin salida", "Define la ruta del archivo de salida.")
+            return
+
+        self.log("Iniciando consolidacion...")
+        for f in self.archivos:
+            self.log(f"  > {os.path.basename(f)}")
+
+        try:
+            df = consolidar(self.archivos)
+            if df.empty:
+                self.log("AVISO: No se encontraron datos.")
+                messagebox.showwarning(
+                    "Sin datos",
+                    "No se pudieron extraer datos.\n"
+                    "Verifica que el nombre del archivo incluya:\n"
+                    "B-2401, B-3301, C-1301, C-2301 o C-4301"
+                )
+                return
+
+            n_ind = len([c for c in df.columns if c not in
+                         ["Tipo","Entidad","Periodo","Fecha Ratio Capital Global"]])
+            self.log(f"OK - Entidades  : {len(df)}")
+            self.log(f"OK - Indicadores: {n_ind}")
+            exportar_excel(df, output)
+            self.log(f"OK - Guardado en: {output}")
+            messagebox.showinfo(
+                "Consolidacion exitosa",
+                f"Archivo guardado en:\n{output}\n\n"
+                f"Entidades  : {len(df)}\n"
+                f"Indicadores: {n_ind}\n\n"
+                f"Hoja 1 - Tabla pivote (para analisis)\n"
+                f"Hoja 2 - Formato largo (Para_SQL)"
+            )
+        except Exception as e:
+            import traceback
+            self.log(f"ERROR: {e}")
+            self.log(traceback.format_exc())
+            messagebox.showerror("Error", str(e))
+
+
+# =============================================================================
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
